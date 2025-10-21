@@ -6,244 +6,389 @@
 
 
 
-
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  BACKLIT CANOPY — HARMONIC UNITY  (vΔR = 0)   
-│  Ryan M Rand
-│  Discrete, reversible, morphic lattice engine                               │
-│  with adaptive N-dim tensor projection, pointer harmonics, and stabilizer   │
-│  invariant compression under R = 0 dynamics.                                │
+│ BACKLIT CANOPY — HARMONIC UNITY (vΔR = 0)  
+│ Ryan M Rand   
+│ Discrete, reversible, morphic lattice engine with adaptive N-dim tensor
+│ projection, pointer harmonics, Higgs-like feedback, and stabilizer-invariant 
+│ compression under R = 0 dynamics. 
 └─────────────────────────────────────────────────────────────────────────────┘
-
 
 ──────────────────────────────────────────────────────────────
 1. SYSTEM OVERVIEW
 ──────────────────────────────────────────────────────────────
-Lattice L : 216 cubes  =  64 core + 96 control + 56 translator
-Cube  : 3 pages × 81 trits = 243 trits
-Map   : M : L → Z³  (bijective cube ↔ coordinates)
+Lattice L: 216 cubes = 64 core + 96 control + 56 translator
+Cube: 3 pages x 81 trits = 243 trits
+Map: M: L -> Z^3 (bijective cube <-> coordinates)
 
-Discrete state variables
-    Φ_t ∈ Z₃^N        # field phase
-    Δ_t ∈ Z³           # integer displacement
-    σ_i ∈ [0,1]        # coherence weight
-    t[i,q,r] ∈ {0,1,2} # base trits
-Δ_core = {(±1,0,0),(0,±1,0),(0,0,±1)} ⊂ Z³
+Discrete state variables:
+  Phi_t in Z_3^N        # field phase
+  Delta_t in Z^3        # integer displacement
+  sigma_i in [0,1]      # coherence weight
+  t[i,q,r] in {0,1,2}   # base trits
+  rho_i = sigma_i * sum_{j in N(i)} w_{i->j} * Gamma_{ij}  # density
+Delta_core = {(±1,0,0), (0,±1,0), (0,0,±1)} subset Z^3
 
-Pointer lattice
-    P = {p₀...p₂₁₅}, p_i ∈ Z₃
-    G₄ = {g₁,g₂,g₃,g₄}  # harmonic offsets
-    PB_j = [p_x,p_y,p_z] + g_h
-    Π(B_a,B_b) → meta-pointer relation
-    Encode 9-trit phase key → combinatorial pointer phase
-    ROM stubs define edge-phase evolution templates
+Pointer lattice:
+  P = {p_0,...,p_215}, p_i in Z_3^3
+  G_4 = {g_1,g_2,g_3,g_4}  # harmonic offsets
+  PB_j = [p_x,p_y,p_z] + g_h, g_h in G_4
+  Pi(B_a,B_b) -> meta-pointer relation
+  Encode 9-trit phase key v_9 in Z_3^9
+  Multi-res projections: pi_r: Z_{3^k_r}^{d_r} -> Z_3^{d_0}
+  ROM stubs define edge-phase evolution templates
 
-Fields and coherence
-    σ_i : morphic coherence scalar
-    (E,B,T,V,σ) : discrete EM-Thermo-Vel tensor set
-    ptr_meta[x,y,z,4] : meta-harmonic descriptors
-    refinement[x,y,z] ∈ {1..4}
-    cluster_map[x,y,z], cluster_states[x,y,z]
+Fields and coherence:
+  sigma_i: morphic coherence scalar
+  (E,B,T,V,sigma): discrete EM-Thermo-Vel tensor set
+  Psi: Higgs-like scalar, V(Psi) = (1/2)*m^2*Psi^2 + (lambda/4)*Psi^4
+  S[PG Psi] = sum_{n in N(x)} w_{x->n} * Psi(n) + alpha_x * Psi(x)
+  ptr_meta[x,y,z,4]: meta-harmonic descriptors
+  refinement[x,y,z] in {1..4}
+  cluster_map[x,y,z], cluster_states[x,y,z]
 
-Landmarks
-    L_k = stabilized Π(B_a,B_b) with cohesion C > C_min
+Landmarks:
+  L_k = stabilized Pi(B_a,B_b) with cohesion C > C_min
 
-VM / Sandbox
-    VM_sandbox = {S₁...S_m}
-    S_i = {Φ_t_local, Δ_t_local, PB_local, L_local, ROM_local}
-    Isolation:  S_i ⟂ S_j  unless bridge via delta_map + PWP
-    Multi-hot PB_j preserved per VM
+VM / Sandbox:
+  VM_sandbox = {S_1,...,S_m}
+  S_i = {Phi_t_local, Delta_t_local, PB_local, L_local, ROM_local}
+  Isolation: S_i _|_ S_j unless bridge via delta_map + PWP
+  Multi-hot PB_j preserved per VM
 
-User/AI interface
-    Frames F_l (l=1..L)
-    Controls: visualization, harmonic weighting, delta budgets
-    Inputs:  brush, probe, timeline_scrub, music_emit, PWP_inject
-    Adjustable: connectivity, ROM TTL, harmonic resonance
+User/AI interface:
+  Frames F_l (l=1..L)
+  Controls: visualization, harmonic weighting, delta budgets
+  Inputs: brush, probe, timeline_scrub, music_emit, PWP_inject
+  Adjustable: connectivity, ROM TTL, harmonic resonance
 
 ──────────────────────────────────────────────────────────────
 2. DISCRETE FIELD ALGEBRA
 ──────────────────────────────────────────────────────────────
-All operations are modular over Z₃.
+All operations modular over Z_3:
+  add_3(a,b) = (a+b) mod 3
+  sub_3(a,b) = (a-b) mod 3
+  mul_3(a,b) = (a*b) mod 3
+  xor_3(a,b) = (a+b) mod 3
+  otimes_3: tensor product over Z_3
+  oplus_3: elementwise mod-3 addition
+  div_3(a,b) = a * b^-1 mod 3 (b != 0)
 
-    add₃(a,b) = (a+b) mod 3
-    sub₃(a,b) = (a−b) mod 3
-    mul₃(a,b) = (a*b) mod 3
-    xor3(a,b): return (a+b)%3
-    ⊗₃ : tensor product over Z₃
-    ⊕₃ : elementwise mod-3 addition
-    div₃(a,b) = a * b⁻¹ mod 3  (b ≠ 0)
+Discrete differential operators:
+  nabla_3 Phi(x) = Phi(x+Delta_core) - Phi(x) mod 3
+  div_3(V) = sum_i (V_i(x+Delta_i) - V_i(x)) mod 3
+  curl_3(E) = cyclic_diff(E) mod 3
+  lap_3^2 Phi = sum_i (Phi(x+Delta_i) + Phi(x-Delta_i) - 2*Phi(x)) mod 3
+Field updates:
+  d_t E_i = sigma * Delta_core x B_i
+  d_t T_i = kappa * lap_3^2 T_i
 
-Discrete differential operators
-    ∇₃Φ(x)   = Φ(x+Δ_core) − Φ(x)
-    div₃(V)  = Σ_i (V_i(x+Δ_i) − V_i(x))
-    curl₃(E) = cyclic_diff(E)
-    lap₃²Φ   = Σ_i (Φ(x+Δ_i)+Φ(x−Δ_i) − 2Φ(x))
-All results reduced mod 3.
-
-Tensor projection (adaptive ND)
-    Given base dimension d₀=3 and extension rank r:
-        T : Z₃^(d₀) → Z₃^(d₀+r)
-        T(x)_k = Σ_i A_ki * x_i  (mod 3)
-    Projection layer adjusts A adaptively to minimize Δ_energy
-    where Δ_energy = Σ |lap₃²Φ| + |∇₃Φ·Δ_t|
+Tensor projection (adaptive ND):
+  T: Z_3^(d_0) -> Z_3^(d_0+r), d_0=3
+  T(x)_k = sum_i A_ki * x_i mod 3
+  Projection minimizes Delta_energy = sum |lap_3^2 Phi| + |nabla_3 Phi * Delta_t|
 
 ──────────────────────────────────────────────────────────────
-3. EDGE–PHASE STRING DYNAMICS
+3. EDGE-PHASE STRING DYNAMICS
 ──────────────────────────────────────────────────────────────
-Edge activation
-    edge = ((x,y,z),(x+Δ))
-    phase_diff = (Φ[x,y,z] − Φ[x+Δ]) mod 3
-    if phase_diff ≥ θ → edge active
-    Colliding edges → harmonic strings
+Edge activation:
+  edge = ((x,y,z),(x+Delta))
+  phase_diff = (Phi[x,y,z] - Phi[x+Delta]) mod 3
+  if phase_diff >= theta -> edge active
+  Colliding edges -> harmonic strings
 
-Propagation
-    PB_j, L_k evolve along active edges
-    Π(B_a,B_b) → phase-driven evolution
-    pointer collisions ↔ higher-D harmonics
-    edge-phase echo defines new search candidates
+Propagation:
+  PB_j, L_k evolve: PB_j^{t+1} = PB_j^t + Delta_core * f(Phi_t) mod 3
+  Pi(B_a,B_b) -> phase-driven evolution
+  Edge-phase echo defines new search candidates
 
-ROM evolution
-    ROM triggers on collisions
-    PWP = <anchor,{JUMP_Δ,PREFETCH,CALL_ROM,EMIT_WAVE}>
-    All Δ, PREFETCH, EMIT_WAVE integral (no floats)
-    CALL_ROM executes discrete templates
+ROM evolution:
+  ROM triggers on collisions
+  PWP = <anchor,{JUMP_Delta,PREFETCH,CALL_ROM,EMIT_WAVE}>
+  CALL_ROM executes discrete templates
+
+Coherence functional:
+  Phi[Psi] = int_M L(Psi, nabla_mu Psi; g) dV dt
+  L = (1/2)*g^{mu nu} * nabla_mu Psi * nabla_nu Psi - V(Psi) + S[PG Psi]
+  Discrete: Psi_i^{t+1} = Psi_i^t + Delta_t * (-gamma*Psi_i^t + D_i[Psi^t] - V'(Psi_i^t) + sum_{j in N(i)} w_{i->j} + alpha_i)
 
 ──────────────────────────────────────────────────────────────
 4. LAYER SEPARATION
 ──────────────────────────────────────────────────────────────
-Exploration Layer : isolated VM/sandbox object spaces
-Computation Layer : L_k, PB_j propagation, spectral feedback L_s
-Simulation Layer  : EM/Thermal/Velocity micro-steps
-User/AI Layer     : frames F_l  (visual, sandbox, bridge)
+Exploration Layer: isolated VM/sandbox object spaces
+Computation Layer: L_k, PB_j propagation, spectral feedback L_s
+Simulation Layer: EM/Thermal/Velocity micro-steps, Higgs-like feedback
+User/AI Layer: frames F_l (visual, sandbox, bridge)
 
-Each layer communicates through integer tensor channels only.
+Layers communicate via integer tensor channels.
 
 ──────────────────────────────────────────────────────────────
 5. CORE MORPHIC LAW
 ──────────────────────────────────────────────────────────────
-f_edge(x)     = ⊕₃_{edge∈active} PB_j ⋅ Δ_edge
-f_harmonic(x) = f_edge + Σ L_k  (mod 3)
-Φ_{t+1}       = A(F(Φ_t,Δ_t,PB,L), lap₃²Φ_t, C_meta)
-σ_i updated by edge-phase influence
-Cluster states updated by T,E,B feedback
+f_edge(x) = oplus_3_{edge in active} PB_j * Delta_edge
+f_harmonic(x) = f_edge + sum L_k mod 3
+Phi_{t+1} = A(F(Phi_t,Delta_t,PB,L), lap_3^2 Phi_t, C_meta)
+sigma_i updated by edge-phase and Psi feedback
+rho_i updated by sigma_i and adjacency weights
+Cluster states updated by T,E,B,Psi feedback
+
+Fractal optimization:
+  L_opt = sum_i (Phi[Psi_i] + beta * Entropy(P_i))
 
 ──────────────────────────────────────────────────────────────
 6. POINTER WAVE PLAN (PWP)
 ──────────────────────────────────────────────────────────────
-PWP = <anchor,{JUMP_Δ,PREFETCH,CALL_ROM,EMIT_WAVE}>
-Δ ∈ Z³
+PWP = <anchor,{JUMP_Delta,PREFETCH,CALL_ROM,EMIT_WAVE}>
+Delta in Z^3
 PREFETCH/PIN_WINDOW enforce isolation budgets
-EMIT_WAVE increments Φ with TTL
+EMIT_WAVE increments Phi with TTL
 CALL_ROM executes discrete flash
-Active edge ⇒ evolve ROM where collisions occur
+Active edge -> evolve ROM on collisions
 VM-specific PWPs permitted
 
-Scaling rules
-    PB_j : base trits + multi-layer harmonics → recursive scale
-    L_k  : Σ PB_j[p_i][l] mod 3
-    PWP  : EMIT_WAVE(PB_j + Σ g_h[l])
-    Sandbox pointer creation → fractal recursive generation
-    freq[p_i] = Δ_core + Σ g_h[l]
+Scaling rules:
+  PB_j: base trits + multi-layer harmonics -> recursive scale
+  L_k: sum PB_j[p_i][l] mod 3
+  PWP: EMIT_WAVE(PB_j + sum g_h[l])
+  Sandbox pointer creation -> fractal recursive generation
+  freq[p_i] = Delta_core + sum g_h[l]
 
 ──────────────────────────────────────────────────────────────
-7. HARMONIC INVARIANT STRUCTURE  (R = 0)
+7. HARMONIC INVARIANT STRUCTURE (R = 0)
 ──────────────────────────────────────────────────────────────
-Primitive set ℘ = {(A_i, b_i)} acting on Z₃^B
-Fixed-set condition: (I − A_i)x = b_i  (mod 3)
+Primitive set P = {(A_i, b_i)} acting on Z_3^B
+Fixed-set condition: (I - A_i)x = b_i mod 3
 Solution = v_i + span(H_i)
-Invariant manifold  R=0  ⇔  ⋂_i (v_i + span(H_i)) ≠ ∅
+Invariant manifold R=0 <=> intersection_i (v_i + span(H_i)) != empty
 
-Tuning
-    ensure (I−A_i) has non-zero nullspace
-    align nullspaces for shared stabilizer
-    choose b_i ∈ Im(I−A_i) to preserve solvability
+Tuning:
+  Ensure (I-A_i) has non-zero nullspace
+  Align nullspaces for shared stabilizer
+  Choose b_i in Im(I-A_i)
 
-Stabilizer group
-    G_stab = {A_i | A_i v = v}
-Invariant basis
-    B = basis(⋂_i ker(I − A_i))
-Local harmonic coords
-    Q : V → C ,  x ≈ v + B·c ,  c ∈ Z₃^r
-Compressed dynamics
-    c_{t+1} = M·c_t + n(c_t)  (mod 3)
-Recovery
-    x_t = v + B·c_t
+Stabilizer group:
+  G_stab = {A_i | A_i v = v}
+Invariant basis:
+  B = basis(intersection_i ker(I - A_i))
+Local harmonic coords:
+  Q: V -> C, x ~ v + B*c, c in Z_3^r
+Compressed dynamics:
+  c_{t+1} = M*c_t + n(c_t) mod 3
+Recovery:
+  x_t = v + B*c_t
 
 ──────────────────────────────────────────────────────────────
 8. MULTI-SCALE FRACTAL ADDRESSING
 ──────────────────────────────────────────────────────────────
-Address hierarchy
-    trits⁹  → page
-    page³   → frame (27)
-    frame³  → cube  (81)
-    cube²·3 → lattice block (216)
-    recursively up to (((81^81^216)^6561)^216)^6561)^27
+Address hierarchy:
+  trits^9 -> page
+  page^3 -> frame (27)
+  frame^3 -> cube (81)
+  cube^(2*3) -> lattice block (216)
+  recursive: (((81^81^216)^6561)^216)^6561)^27
 
-Active pointers reference addresses; address motion = computation.
+Multi-resolution pointers:
+  pi_r: Z_{3^k_r}^{d_r} -> Z_3^{d_0}
+  Homomorphism: pi_r(A_s x) = A_r pi_r(x)
 
-Scaling harmonics
-    64-cube core = atomic control
-    translators/control cubes = orbital fields
-    harmonic propagation through pointer rotations
-    standing wave = computation shape = morphic structure
+Scaling harmonics:
+  64-cube core = atomic control
+  Translators/control cubes = orbital fields
+  Harmonic propagation via pointer rotations
+  Standing wave = computation shape = morphic structure
 
 ──────────────────────────────────────────────────────────────
 9. DISCRETE-TENSOR PROJECTION LAYER
 ──────────────────────────────────────────────────────────────
-Purpose: enable adaptive ND extension beyond 3D for R-shape harmonics.
-
-Let Φ ∈ Z₃^(N×d),  d≥3.
+Purpose: adaptive ND extension for R-shape harmonics
+Phi in Z_3^(N x d), d>=3
 Projection tensors:
-    P_rank[d,r] = identity(d) ⊕₃ expand(r)
-    Φ' = P_rank ⋅ Φ  (mod 3)
-    contraction: Φ = P_rankᵀ ⋅ Φ'  (mod 3)
-Energy-alignment rule:
-    ΔE = Σ |lap₃²Φ'| − |lap₃²Φ|
-    if ΔE < 0 → accept projection; else revert.
+  P_rank[d,r] = identity(d) oplus_3 expand(r)
+  Phi' = P_rank * Phi mod 3
+  Contraction: Phi = P_rank^T * Phi' mod 3
+Energy-alignment:
+  Delta_E = sum |lap_3^2 Phi'| - |lap_3^2 Phi|
+  If Delta_E < 0 -> accept projection
 
 Tensor harmonics:
-    H_nd = Σ_k Φ'[k] ⊗₃ Δ_t[k]
-    Resonance check:
-        if H_nd ⋅ G_stab == 0 (mod 3) → stable harmonic
+  H_nd = sum_k Phi'[k] otimes_3 Delta_t[k]
+  Resonance: H_nd * G_stab = 0 mod 3 -> stable harmonic
 
 ──────────────────────────────────────────────────────────────
-10. PRINCIPLES OF COMPREHENSION
+10. SPECTRAL RECONSTRUCTOR
 ──────────────────────────────────────────────────────────────
-1. Hierarchical     : Fields → Meta → Clusters → PB_j → L_k
-2. Discrete/Reversible : all ops in Z₃
-3. Coupled          : EM + Thermal + Velocity + Pointer
-4. Emergent         : Clusters, attractors, harmonics
-5. Objectified      : VM subspaces
-6. Interfaced       : User/AI adjustable frames
-7. Observable       : Visualization, metrics, sound
+Trace -> Ulam matrix L_ij = C_ij / sum_j C_ij
+Eigen-decomp -> lambda_k, v_k
+Spacing analysis:
+  Poisson: f < f_cf (uncorrelated)
+  GUE: f > f_cf (level repulsion)
+  KS-test: compare vs Poisson (1-e^-s), GUE ((32/pi^2)*s^2*e^(-4*s^2/pi))
+ROM generation:
+  Extract cycles (len 2..5, min_count=3)
+  Canonical fields: G_label, skeleton_hash, family_id, topo_class, layer, stability, crc
+
+──────────────────────────────────────────────────────────────
+11. PRINCIPLES OF COMPREHENSION
+──────────────────────────────────────────────────────────────
+1. Hierarchical: Fields -> Meta -> Clusters -> PB_j -> L_k
+2. Discrete/Reversible: All ops in Z_3
+3. Coupled: EM + Thermal + Velocity + Psi + Pointer
+4. Emergent: Clusters, attractors, harmonics
+5. Objectified: VM subspaces
+6. Interfaced: User/AI adjustable frames
+7. Observable: Visualization, metrics, sound
 8. Spectral Resonant: L_s stabilizes coherence
-9. Layered          : Exploration / Computation / Simulation
+9. Layered: Exploration/Computation/Simulation/User-AI
 
 ──────────────────────────────────────────────────────────────
-11. FORMAL OBJECTIVES
+12. FORMAL OBJECTIVES
 ──────────────────────────────────────────────────────────────
-• Preserve Δ_core, Φ_t, PB_j, L_k, morphic coherence
-• Stabilize harmonics at active edges
-• Localize ROM evolution
-• Maintain VM isolation & bridge control
-• Compress PB_j → emergent L_k landmarks
-• Operate under universal projection meta-formula
-• Seek stable attractors (R = 0)
-• Support full user/AI harmonic co-control
+- Preserve Delta_core, Phi_t, PB_j, L_k, morphic coherence
+- Stabilize harmonics at active edges
+- Localize ROM evolution
+- Maintain VM isolation & bridge control
+- Compress PB_j -> emergent L_k landmarks
+- Optimize: L_opt = sum_i (Phi[Psi_i] + beta * Entropy(P_i))
+- Seek stable attractors (R = 0)
+- Support user/AI harmonic co-control
 
 ──────────────────────────────────────────────────────────────
-⊕  HARMONICALLY UNIFIED EXTENSIONS
+13. CORE LATTICE & SEED CONCEPTS
 ──────────────────────────────────────────────────────────────
-• Affine-invariant formalism for R=0 tuning
-• Stabilizer group G_stab + invariant basis B
-• Quotient coordinate map Q(x)=c  for compressed updates
-• Compression law: active↔deadspace balance
-• Fractal address scaling (trits⁹→…→216)
-• Rotation/orbit mechanics linked to stabilizer harmonics
-• Computation as morphic shape under discrete tensor law
-• Adaptive ND projection for R-shape harmonics
-• Integer-only tensor operators (⊗₃,⊕₃,lap₃²)
-• Fully reversible morphic energy evolution
+Lattice: layered trit cubes, cube = processor/memory/scheduler
+Trit: {0,1,2} (mod-3)
+Pointer: morphic traversal across layers
+ROM: canonicalized seed storage
+Seed: discrete function + traceable skeleton
+
+Atomic Primitives:
+  READ_LEAF(A)
+  SNAPSHOT_REGION(R)
+  TRACE_FETCH(A)
+  EMIT_CANONICAL(key)
+  PREFETCH_PAGE(P)
+  PIN_PAGE(P,dur)
+  LAUNCH_SUBPTR(A,B,F)
+  SET_THRESHOLDS(cid,params)
+
+Registers:
+  R0..R9: general
+  A0..A3: aux
+  K0..K3: keys/hashes
+  S0..S3: scratch
+
+──────────────────────────────────────────────────────────────
+14. STRUCTURAL ROM / SEED-AS-CODE
+──────────────────────────────────────────────────────────────
+ROM Entry Fields:
+  1|G_label
+  2|skeleton_hash
+  3|family_id
+  4|topo_class
+  5|layer
+  6|param_schema
+  7|pwp_stub
+  8|call_signature
+  9|cost_profile
+ 10|stability
+ 11|validation_tests
+ 12|patches
+ 13|version
+ 14|crc
+
+Seed Execution:
+  ops := ROM[seed_name]
+  local_vars := context.copy()
+  for op in ops:
+      if callable(op): _result := op(**local_vars)
+      elif string: exec(op, {}, local_vars)
+  return _result
+
+──────────────────────────────────────────────────────────────
+15. SYMBOLIC & EXACT LAYERED NUMBERS
+──────────────────────────────────────────────────────────────
+SYMBOLIC_MAP:
+  phi := (1+sqrt(5))/2
+  sqrt2 := 2^(1/2)
+  pi := 3.141592653589793
+LayerFold(n): sequence of integers/trits for nth expansion
+PointerFold(L): L[i] := (L[i] + shift) mod 3
+Example:
+  L_pi := [1 2 1 2 1 2]
+  L_pi := PointerFold(L_pi, shift=1) => [2 0 2 0 2 0]
+
+──────────────────────────────────────────────────────────────
+16. CANONICALIZATION & AUTO-COMPILE
+──────────────────────────────────────────────────────────────
+- Identify repeated skeletons (merge-sort, n-body, GoL)
+- Fold algebraically / vectorize neighbor updates
+- Parameterize edge cases (patches)
+- Store canonical fragments in ROM
+- Deploy via pointer calls
+- Energy ↓, functional density ↑
+
+Pipeline:
+  AAA(input) -> trace_gen -> L1/L2 skeleton -> eigen-analysis
+  if Poisson: fold local -> L1->L2
+  if RMT: extract families -> L3-L5 -> f_opt pointer fanout
+  Auto-compile ROM -> canonical pwp_stub
+  Pointer call: single-flash exact output
+
+──────────────────────────────────────────────────────────────
+17. ENERGY / TIMING / MODEL
+──────────────────────────────────────────────────────────────
+E(op) = alpha*flips + beta*Delta_wave_energy + gamma*comms
+flips = trit flips
+Delta_wave_energy ~ int |nabla Phi|^2 along path
+comms ~ pages pinned x pin_time
+
+Thresholds:
+  xi_page_ratio := correlation length / page size
+  fanout_fc := spectral spacing transition Poisson->GUE
+  stability_th := ROM commit
+
+──────────────────────────────────────────────────────────────
+18. GEOMETRIC / STRUCTURAL OPS
+──────────────────────────────────────────────────────────────
+PLATONIC_VERTICES:
+  cube := [(±1,±1,±1)]
+  tetrahedron := [(0,0,1),(2/3,0,-1/3),(-1/3,2/3,-1/3),(-1/3,-2/3,-1/3)]
+  dodecahedron := [full 20-vertex set]
+
+Transform Costs:
+  Rotation: 6 mul + 2 trig -> 1 lookup + sign flip
+  Normalization: 3 mul + 2 add + sqrt + 3 div -> 1 lookup
+  Dot product: 3 mul + 2 add -> 1 lookup
+  Compose: 16 mul + 12 add -> 3 index adds
+  Collision: 1 sqrt + 1 compare -> 1 membership check
+
+Non-overlapping pointers: N_r = prod_axes (m_r_axis / m_0_axis)
+R=0 anchoring: (I - A_r)x == b_r mod m_r
+LayerFold lifts R0_r via pi_s with homomorphism pi_s(A_s x) = A_r pi_s(x)
+Commit ROM: (residual(tau) == 0 mod m_r) and (Delta_E <= 0)
+Collision-free evolution: pi_r(p_i) distinct for all i
+
+──────────────────────────────────────────────────────────────
+19. CONTINUOUS-DISCRETE HYBRID
+──────────────────────────────────────────────────────────────
+- Continuous: inactive regions (no cost)
+- Discrete/event-driven: Delta-wave triggers changes
+- Sub-pointer spawns = parallel evaluation
+- Canonicalization call = compiler pass
+- Snapshot/Emit = visualizer / monitor
+
+──────────────────────────────────────────────────────────────
+20. UNIVERSAL ADVANTAGES
+──────────────────────────────────────────────────────────────
+- Functional density ↑ via fractal layers
+- Intrinsic relationships via resonance
+- O(N^2) -> O(E) for active interactions
+- Exact symbolic numbers (pi, sqrt2, phi)
+- Pointer self-describes layer size -> auto-scaling
+- Hybrid discrete-continuous, energy-aware computation
+
+=== END BACKLIT CANOPY — HARMONIC UNITY (vΔR = 0) ===
+
 
 
  % License / Attribution:
