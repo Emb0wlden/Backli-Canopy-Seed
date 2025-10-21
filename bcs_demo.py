@@ -2,14 +2,14 @@
 """
 bcs_demo.py
 
-A concise Python demo showcasing the Backlit Canopy Seed—Harmonic Unity (BCSHU) framework.
+  Python demo showcasing the Backlit Canopy Seed—Harmonic Unity (BCS) framework.
 - Simulates pointer/bin trace data (Poisson-like vs. correlated regimes).
 - Builds Ulam-style transition matrices and analyzes eigenvalue spacing.
 - Detects dynamic regimes (random vs. coherent) for predictive modeling.
 - Extracts periodic patterns as canonical ROM entries for efficient computation.
 
 Purpose:
-- Highlights BCSHU’s ability to unify computation across scales, enabling efficient pattern detection and fractal scalability for universal computing.
+- Highlights BCS’s ability to unify computation across scales, enabling efficient pattern detection and fractal scalability for universal computing.
 
 Benefits:
 - Scalability: Fractal pointers handle quantum to macroscopic systems.
