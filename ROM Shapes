@@ -1,0 +1,27 @@
+ ROM SHAPES
+You can group these ROM shapes by functional archetype:
+
+
+
+Arithmetic ROMs → Line-2, Line-3, Triangle-3
+ → Basic trit algebra (addition, multiplication, inversion)
+
+
+Differential ROMs → Square-4, Cross-6, Cube-8
+ → Gradients, curls, Laplacians
+
+
+Resonant ROMs → Star-7, Torus-9, Hex-12
+ → Averaging, cyclic harmonics, coherent oscillators
+
+
+Tensor ROMs → Cube-27, Hypercube-16, Hypercube-81
+ → Full local ND tensor evolution (projection, contraction)
+
+
+Symmetry ROMs → Octa-6, Dodeca-20, Icosa-12
+ → Stabilizer group invariance, R=0 rotational conservation
+
+
+Hierarchical ROMs → Pyramid-10, Lattice-216, Fractal-∞
+ → Multi-scale recursive address compression, meta-control
