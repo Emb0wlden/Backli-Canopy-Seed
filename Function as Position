@@ -1,3 +1,30 @@
+All arithmetic is performed in the finite ring:
+Z3={0,1,2},with addition and multiplication mod 3.
+positioning the data via relationships.
+
+⊕
+a⊕b=(a+b)mod3 Modular addition (phase fusion)
+⊖
+a⊖b=(a−b)mod3 Modular subtraction (phase inversion)
+⊗
+a⊗b=(a⋅b)mod3 Modular multiplication (energy coupling)
+We define an N-dimensional lattice:
+
+Λ={(i1,i2,…,iN)∣0≤ik<Lk}, where Lk are integer side lengths.
+Each lattice node x∈Λ carries a trit-valued state vector:
+
+Φt(x)=(ψt(x),pt(x),nt(x))∈(Z3)3,
+representing, respectively:
+
+ψ — potential field,
+p — local momentum or flow direction,
+n — pointer phase or harmonic orientation.
+Time is discrete: 
+t=0,1,2,…
+
+
+
+
 
 1. Riemann Hypothesis (Primes ↔ Zeta)
 # Map integers n → 9-trit vectors X[n]
