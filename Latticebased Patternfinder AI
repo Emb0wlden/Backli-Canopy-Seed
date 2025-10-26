@@ -1,0 +1,527 @@
+
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+BACKLIT CANOPY — HARMONIC UNITY (vΔR = 0)
+Complete working version
+Discrete trit-structural simulation (CPU/CUDA)
+"""
+
+from __future__ import annotations
+import argparse, math, time, os, itertools, json
+from dataclasses import dataclass, asdict, field
+from typing import Tuple, Optional, List, Dict, Any, Callable
+import torch, numpy as np, networkx as nx
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import eigsh
+
+# ===================== DEVICE =====================
+def default_device(force: Optional[str] = None) -> torch.device:
+    if force:
+        if force.lower() == "cpu":
+            return torch.device("cpu")
+        if force.lower() == "cuda":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ===================== CONFIG =====================
+@dataclass
+class Config:
+    size: Tuple[int,int,int] = (8,8,8)
+    steps: int = 30
+    seed: Optional[int] = 1234
+    device_name: Optional[str] = None
+    jit: bool = False
+    save_state: Optional[str] = None
+    load_state: Optional[str] = None
+    verbose: bool = True
+    fractal_levels: int = 3
+    cluster_factor: int = 3
+    threshold_theta: int = 1
+    pointer_dim: int = 27
+    motif_cache_limit: int = 10000
+    n_hot: int = 2
+    symmetry_group: str = "C3"
+    boost_gamma: float = 0.3
+    boost_lambda: float = 0.005
+    lambda_damp: float = 0.1
+    interface: str = "cli+json"
+    profile: bool = False
+
+    def device(self) -> torch.device:
+        return default_device(self.device_name)
+
+# ===================== TRIT OPS =====================
+DTYPE = torch.int8
+def mod3(x): return ((x % 3) + 3) % 3
+def add3(a,b): return mod3(a+b)
+def sub3(a,b): return mod3(a-b)
+def mul3(a,b): return mod3(a*b)
+def pack_trits(x): return mod3(x).to(DTYPE)
+def unpack_trits(x): return mod3(x)
+
+# ===================== STRUCT =====================
+@dataclass
+class LatticeState:
+    Phi: torch.Tensor; Sigma: torch.Tensor; Rho: torch.Tensor; Psi: torch.Tensor
+    E: torch.Tensor; B: torch.Tensor; T: torch.Tensor; V: torch.Tensor
+    PB: torch.Tensor; L: torch.Tensor
+    GoldenPointer: torch.Tensor; PiPointer: torch.Tensor; EPointer: torch.Tensor
+    Sqrt2Pointer: torch.Tensor; FeigPointer: torch.Tensor; GammaPointer: torch.Tensor; AlphaPointer: torch.Tensor
+    cfg: Config; level: int = 0
+    coherence_order: Optional[torch.Tensor] = None
+    fragment_library: Dict[str, torch.Tensor] = field(default_factory=dict)
+    emergent_score: float = 0.0
+
+    @property
+    def size(self): return self.Phi.shape
+
+# ===================== GRAPH & METRICS =====================
+def build_periodic_graph(state: LatticeState, threshold: int = 1):
+    X,Y,Z = state.size
+    G = nx.grid_graph([X,Y,Z], periodic=True)
+    edges = []
+    Phi = unpack_trits(state.Phi)
+    for (x,y,z) in G.nodes:
+        p = Phi[x,y,z].item()
+        for dx,dy,dz in [(1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)]:
+            xn,yn,zn = (x+dx)%X, (y+dy)%Y, (z+dz)%Z
+            q = Phi[xn,yn,zn].item()
+            if abs(p-q) >= threshold:
+                edges.append(((x,y,z),(xn,yn,zn)))
+    G.add_edges_from(edges)
+    return G
+
+def compute_s_norm(state: LatticeState) -> torch.Tensor:
+    Phi = unpack_trits(state.Phi)
+    Sigma = unpack_trits(state.Sigma)
+    entropy = mod3(Phi + Sigma)
+    return entropy
+
+def compute_emergent_score(state: LatticeState) -> float:
+    Phi = unpack_trits(state.Phi)
+    uniq = torch.unique(Phi).numel()
+    s_norm = compute_s_norm(state)
+    return float(uniq + s_norm.float().mean().item())
+# Surrogate training + integration utilities
+import random
+from torch.utils.data import Dataset, DataLoader
+
+class PatchDataset(Dataset):
+    """
+    Dataset of (input_patch, target_patch) where:
+    - input_patch: shape [C_in, p, p, p] (C_in channels; e.g., Phi,Sigma,Rho or just Phi)
+    - target_patch: shape [p, p, p] ints in {0,1,2} for next Phi (center or whole patch)
+    """
+    def __init__(self, inputs: torch.Tensor, targets: torch.Tensor):
+        assert inputs.shape[0] == targets.shape[0]
+        self.inputs = inputs
+        self.targets = targets
+
+    def __len__(self):
+        return self.inputs.shape[0]
+
+    def __getitem__(self, idx):
+        return self.inputs[idx], self.targets[idx]
+
+def extract_patches_from_state(state: LatticeState, patch_size: int = 5, stride: int = 2,
+                               include_fields: List[str] = ['Phi','Sigma','Rho']) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Slide over the lattice and extract patches of size patch_size^3.
+    Returns:
+      inputs: [N, C_in, p, p, p] dtype float32 (we'll embed trit categories into channels)
+      targets: [N, p, p, p] dtype int64 (next Phi)
+    Notes:
+      - This function expects the `state` to contain 'next' state in case you want to collect transitions.
+      - Typical usage: run the simulator one step, collect (current_state -> next_state) pairs.
+    """
+    dev = state.cfg.device()
+    p = patch_size
+    X,Y,Z = state.size
+    fields = []
+    for name in include_fields:
+        tensor = getattr(state, name)
+        # convert to int64 categories [0,1,2]
+        _t = unpack_trits(tensor).to(torch.int64)
+        fields.append(_t)
+    # stack channels: shape [C, X, Y, Z]
+    stacked = torch.stack(fields, dim=0)  # C x X x Y x Z
+    # number of patches
+    patches_in = []
+    patches_tgt = []
+    # we assume you can pass 'next_state_phi' as state_next.Phi separately when collecting
+    # so here we only extract input patches; target extraction done by caller with next_state
+    for x in range(0, X - p + 1, stride):
+        for y in range(0, Y - p + 1, stride):
+            for z in range(0, Z - p + 1, stride):
+                inp = stacked[:, x:x+p, y:y+p, z:z+p].to(torch.float32)  # float32 for conv input
+                patches_in.append(inp.unsqueeze(0))
+    if len(patches_in) == 0:
+        return torch.empty(0), torch.empty(0)
+    inputs = torch.cat(patches_in, dim=0)  # [N, C, p, p, p]
+    return inputs  # targets built separately by caller
+
+def collect_transition_dataset(simulator_run_fn: Callable[[Config], List[LatticeState]],
+                               cfg: Config, patch_size: int = 5, stride: int = 2,
+                               include_fields: List[str] = ['Phi','Sigma','Rho'],
+                               max_samples: int = 20000) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Run the simulator for a short trajectory using exact rules (simulator_run_fn should produce a list of successive LatticeState objects).
+    Extract (input_patch, target_patch) pairs:
+      - input_patch: channels of current state (C x p x p x p)
+      - target_patch: next state's Phi patch (p x p x p ints)
+    Returns tensors:
+      inputs: [N, C, p, p, p] float32 ; targets: [N, p, p, p] int64
+    """
+    # simulator_run_fn must return a list: [state_0, state_1, ..., state_T]
+    states = simulator_run_fn(cfg)
+    inputs_list = []
+    targets_list = []
+    for i in range(len(states)-1):
+        cur = states[i]
+        nxt = states[i+1]
+        inp_patches = extract_patches_from_state(cur, patch_size, stride, include_fields)  # [N, C, p, p, p]
+        if inp_patches.numel() == 0:
+            continue
+        # build targets aligned with same sliding windows
+        p = patch_size
+        X,Y,Z = cur.size
+        tgt_patches = []
+        for x in range(0, X - p + 1, stride):
+            for y in range(0, Y - p + 1, stride):
+                for z in range(0, Z - p + 1, stride):
+                    tgt = unpack_trits(nxt.Phi)[x:x+p, y:y+p, z:z+p].to(torch.int64)
+                    tgt_patches.append(tgt.unsqueeze(0))
+        if len(tgt_patches) == 0:
+            continue
+        targets = torch.cat(tgt_patches, dim=0)  # [M, p, p, p]
+        # ensure equal lengths
+        N = min(inp_patches.shape[0], targets.shape[0])
+        inputs_list.append(inp_patches[:N])
+        targets_list.append(targets[:N])
+        if sum([x.shape[0] for x in inputs_list]) >= max_samples:
+            break
+    if len(inputs_list) == 0:
+        return torch.empty(0), torch.empty(0)
+    inputs = torch.cat(inputs_list, dim=0)[:max_samples]
+    targets = torch.cat(targets_list, dim=0)[:max_samples]
+    return inputs, targets
+
+# ----------------------------
+# Surrogate model (Conv3D classifier)
+# ----------------------------
+import torch.nn as nn
+class Conv3DSurrogate(nn.Module):
+    """
+    Small Conv3D that predicts categorical distribution {0,1,2} for every cell in patch.
+    Input shape: [B, C_in, p, p, p]
+    Output shape (logits): [B, 3, p, p, p]
+    """
+    def __init__(self, in_channels:int, hidden:int = 64, patch_size:int = 5):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(in_channels, hidden, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv3d(hidden, hidden, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.Conv3d(hidden, 3, kernel_size=1)  # produce 3 logits per cell
+        )
+    def forward(self, x):
+        # x: [B,C,p,p,p]
+        logits = self.net(x)  # [B,3,p,p,p]
+        return logits
+
+# ----------------------------
+# Training loop (single model)
+# ----------------------------
+def train_single_surrogate(model: nn.Module, dataset: PatchDataset, cfg: Config,
+                           epochs: int = 10, batch_size: int = 64, lr: float = 1e-3,
+                           device: Optional[torch.device] = None):
+    device = device or cfg.device()
+    model = model.to(device)
+    dl = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.CrossEntropyLoss()  # expects [B, C, p,p,p], targets [B, p,p,p] with integer classes
+    for ep in range(epochs):
+        model.train()
+        total_loss = 0.0
+        for xb, yb in dl:
+            xb = xb.to(device)  # float32
+            yb = yb.to(device)  # int64
+            logits = model(xb)  # [B,3,p,p,p]
+            # reshape for loss: (B* p * p * p, 3) and targets (B* p * p * p)
+            B = logits.shape[0]
+            C = logits.shape[1]
+            p = logits.shape[2]
+            logits_flat = logits.permute(0,2,3,4,1).contiguous().view(-1, C)
+            targets_flat = yb.view(-1)
+            loss = loss_fn(logits_flat, targets_flat)
+            opt.zero_grad(); loss.backward(); opt.step()
+            total_loss += float(loss.item()) * xb.shape[0]
+        avg_loss = total_loss / len(dataset)
+        if cfg.verbose:
+            print(f"[surrogate] Epoch {ep+1}/{epochs} avg_loss={avg_loss:.6f}")
+    return model
+
+# ----------------------------
+# Ensemble training & uncertainty
+# ----------------------------
+def train_ensemble(n_models: int, in_channels: int, dataset: PatchDataset, cfg: Config,
+                   epochs: int = 8, batch_size: int = 64, lr: float = 1e-3) -> List[nn.Module]:
+    ensemble = []
+    for i in range(n_models):
+        if cfg.verbose: print(f"[surrogate] training ensemble member {i+1}/{n_models}")
+        m = Conv3DSurrogate(in_channels=in_channels)
+        ds = dataset  # could augment per-model (bootstrap sampling)
+        # optional bootstrap: sample with replacement
+        # bootstrap_idx = torch.randint(0, len(dataset), (len(dataset),), dtype=torch.long)
+        # ds_boot = torch.utils.data.Subset(dataset, bootstrap_idx.tolist())
+        trained = train_single_surrogate(m, ds, cfg, epochs=epochs, batch_size=batch_size, lr=lr, device=cfg.device())
+        ensemble.append(trained)
+    return ensemble
+
+def ensemble_predict_with_uncertainty(ensemble: List[nn.Module], x: torch.Tensor, cfg: Config):
+    """
+    x: [B, C, p, p, p] float32 on cfg.device()
+    Returns:
+      mean_probs: [B, 3, p, p, p] float32
+      var: [B, p, p, p] float32  (variance across predicted class argmax or entropy)
+    """
+    device = cfg.device()
+    x = x.to(device)
+    preds = []
+    with torch.no_grad():
+        for m in ensemble:
+            m = m.to(device)
+            m.eval()
+            logits = m(x)  # [B,3,p,p,p]
+            probs = torch.softmax(logits, dim=1)  # [B,3,p,p,p]
+            preds.append(probs.unsqueeze(0))  # [1,B,3,p,p,p]
+    preds = torch.cat(preds, dim=0)  # [M,B,3,p,p,p]
+    mean_probs = preds.mean(dim=0)  # [B,3,p,p,p]
+    # compute disagreement: mean entropy across ensemble or variance of argmax counts
+    # simple measure: variance across models in predicted class (argmax)
+    argmax = preds.argmax(dim=2)  # [M,B,p,p,p]
+    # mode agreement fraction
+    mode_vals, counts = torch.mode(argmax, dim=0)
+    agreement = counts.float() / len(ensemble)  # [B,p,p,p]
+    uncertainty = 1.0 - agreement  # higher when models disagree
+    return mean_probs, uncertainty
+
+# ----------------------------
+# Integration helper: surrogate-aware step
+# ----------------------------
+def step_with_surrogate(state: LatticeState, t: int, ensemble: List[nn.Module],
+                        patch_size: int = 5, stride: int = 1, uncertainty_threshold: float = 0.3,
+                        include_fields: List[str] = ['Phi','Sigma','Rho']):
+    """
+    Replace local expensive exact update of Phi by surrogate predictions where uncertainty is low.
+    Workflow:
+      - Extract sliding input patches covering lattice.
+      - For each patch, get ensemble mean_probs + uncertainty.
+      - If uncertainty <= threshold for all cells in patch --> accept surrogate argmax prediction for patch (discrete)
+      - Else: compute exact update locally (fallback) or mark for exact global update.
+    Notes:
+      - This is a patch-level substitution; you must align how exact rules update Phi vs surrogate prediction.
+      - For simplicity below, we only update Phi by surrogate where the whole patch has low uncertainty; otherwise leave Phi to be updated by exact rules after loop.
+    """
+    dev = state.cfg.device()
+    X,Y,Z = state.size
+    p = patch_size
+    # precompute exact update for full lattice (so fallback exists) — you can optionally compute only for uncertain regions
+    exact_state_after = step(copy_state_for_partial_update(state), t)  # run your exact step but on a copy; requires you to import step() logic
+    # We'll apply surrogate predictions where safe, else keep exact_state_after.Phi
+    # Build inputs
+    inputs = []
+    coords = []
+    fields = []
+    for name in include_fields:
+        fields.append(unpack_trits(getattr(state, name)).to(torch.float32))
+    stacked = torch.stack(fields, dim=0)  # C x X x Y x Z
+    for x in range(0, X - p + 1, stride):
+        for y in range(0, Y - p + 1, stride):
+            for z in range(0, Z - p + 1, stride):
+                inp = stacked[:, x:x+p, y:y+p, z:z+p].unsqueeze(0)  # [1,C,p,p,p]
+                inputs.append(inp)
+                coords.append((x,y,z))
+    if len(inputs) == 0:
+        return step(state, t)  # fallback to exact
+    inputs_tensor = torch.cat(inputs, dim=0).to(dev)  # [N, C, p, p, p]
+    mean_probs, uncertainty = ensemble_predict_with_uncertainty(ensemble, inputs_tensor, state.cfg)  # mean_probs [N,3,p,p,p]; uncertainty [N,p,p,p]
+    # apply where patch uncertainty <= threshold everywhere in patch
+    accepted_mask = (uncertainty <= uncertainty_threshold).all(dim=(1,2,3))  # [N]
+    newPhi = unpack_trits(state.Phi).clone()
+    for idx, (x,y,z) in enumerate(coords):
+        if accepted_mask[idx]:
+            probs = mean_probs[idx]  # [3,p,p,p]
+            pred = probs.argmax(dim=0).to(DTYPE)  # [p,p,p] categorical
+            # integrate predicted patch into lattice
+            newPhi[x:x+p, y:y+p, z:z+p] = pred
+        else:
+            # fallback to exact state's patch
+            newPhi[x:x+p, y:y+p, z:z+p] = unpack_trits(exact_state_after.Phi)[x:x+p, y:y+p, z:z+p]
+    state.Phi = pack_trits(newPhi)
+    # finish other updates by copying exact_state_after (or you can reapply exact updates to remaining fields)
+    # copy rest (Sigma,Rho,...) from exact_state_after
+    for name in ['Sigma','Rho','Psi','E','B','T','V','PB','L']:
+        setattr(state, name, getattr(exact_state_after, name))
+    state.fragment_library = detect_fragments(state)
+    state.emergent_score = compute_emergent_score(state)
+    return state
+
+# ---------------
+# small helper: copy minimal state for partial exact update
+# ---------------
+def copy_state_for_partial_update(state: LatticeState) -> LatticeState:
+    # shallow copy of tensors (clone to avoid mutation)
+    return LatticeState(
+        state.Phi.clone(), state.Sigma.clone(), state.Rho.clone(), state.Psi.clone(),
+        state.E.clone(), state.B.clone(), state.T.clone(), state.V.clone(),
+        state.PB.clone(), state.L.clone(),
+        state.GoldenPointer.clone(), state.PiPointer.clone(), state.EPointer.clone(),
+        state.Sqrt2Pointer.clone(), state.FeigPointer.clone(), state.GammaPointer.clone(), state.AlphaPointer.clone(),
+        state.cfg, level=state.level, coherence_order=state.coherence_order, fragment_library=dict(state.fragment_library), emergent_score=state.emergent_score
+    )
+
+# ===================== UPDATE RULES =====================
+def update_phi(state, t):
+    Phi, Sigma, Rho = map(unpack_trits, [state.Phi, state.Sigma, state.Rho])
+    entropy = mod3(Phi + Sigma + Rho)
+    state.Phi = pack_trits(add3(Phi, entropy))
+    return state.Phi
+
+def update_sigma(state, t=0):
+    Phi, Sigma = map(unpack_trits, [state.Phi, state.Sigma])
+    grad = mod3(Phi - Sigma)
+    state.Sigma = pack_trits(add3(Sigma, grad))
+    return state.Sigma
+
+def update_rho(state, t=0):
+    Rho, Phi = map(unpack_trits, [state.Rho, state.Phi])
+    feedback = mod3(Phi * 2)
+    state.Rho = pack_trits(add3(Rho, feedback))
+    return state.Rho
+
+def update_fields(state, t=0):
+    E,B = map(unpack_trits, [state.E, state.B])
+    curlE = torch.roll(E,1,0) - E
+    curlB = torch.roll(B,1,1) - B
+    E = add3(E, pack_trits(curlB))
+    B = sub3(B, pack_trits(curlE))
+    state.E, state.B = pack_trits(E), pack_trits(B)
+    return E,B
+
+def update_psi(state, t=0):
+    Phi, Psi = unpack_trits(state.Phi), unpack_trits(state.Psi)
+    update = (Phi.unsqueeze(-1) + Psi) % 3
+    state.Psi = pack_trits(update)
+    return state.Psi
+
+def update_pb(state, t):
+    PB = unpack_trits(state.PB)
+    mod = (PB + (t % 3)) % 3
+    state.PB = pack_trits(mod)
+    return state.PB
+
+def update_transitions(state, t):
+    Phi, Sigma = unpack_trits(state.Phi), unpack_trits(state.Sigma)
+    diff = (Phi - Sigma) % 3
+    state.L = pack_trits(diff)
+    return state.L
+
+# ===================== FRACTAL COMPRESSION =====================
+def detect_fragments(state, block_size=3):
+    library = {}
+    X,Y,Z = state.size
+    Phi = unpack_trits(state.Phi)
+    for x in range(0,X-block_size+1,block_size):
+        for y in range(0,Y-block_size+1,block_size):
+            for z in range(0,Z-block_size+1,block_size):
+                block = Phi[x:x+block_size,y:y+block_size,z:z+block_size]
+                h = int(block.sum().item()) % 3
+                library[str(h)] = pack_trits(block)
+    return library
+
+# ===================== INIT =====================
+def init_lattice(cfg: Config) -> LatticeState:
+    if cfg.seed: torch.manual_seed(cfg.seed)
+    X,Y,Z = cfg.size; dev = cfg.device()
+    def rnd(shape): return pack_trits(torch.randint(0,3,shape,dtype=DTYPE,device=dev))
+    Phi,Sigma,Rho,T,L = rnd((X,Y,Z)),rnd((X,Y,Z)),rnd((X,Y,Z)),rnd((X,Y,Z)),rnd((X,Y,Z))
+    Psi,E,B,V = rnd((X,Y,Z,3)),rnd((X,Y,Z,3)),rnd((X,Y,Z,3)),rnd((X,Y,Z,3))
+    PB = rnd((X,Y,Z,cfg.pointer_dim))
+    pointers = [rnd((X,Y,Z,cfg.pointer_dim)) for _ in range(7)]
+    state = LatticeState(Phi,Sigma,Rho,Psi,E,B,T,V,PB,L,*pointers,cfg)
+    state.fragment_library = detect_fragments(state)
+    state.emergent_score = compute_emergent_score(state)
+    return state
+
+# ===================== SIMULATION =====================
+def step(state: LatticeState, t: int):
+    cfg = state.cfg
+    update_phi(state,t)
+    update_sigma(state,t)
+    update_rho(state,t)
+    update_fields(state,t)
+    update_psi(state,t)
+    update_pb(state,t)
+    update_transitions(state,t)
+    state.emergent_score = compute_emergent_score(state)
+    return state
+
+def run_simulation(cfg: Config):
+    if cfg.load_state and os.path.exists(cfg.load_state):
+        print("Loading existing state...")
+        state = torch.load(cfg.load_state)
+    else:
+        state = init_lattice(cfg)
+
+    if cfg.verbose:
+        print(f"Initialized lattice {cfg.size} on {cfg.device()} for {cfg.steps} steps")
+
+    t0 = time.time()
+    for t in range(cfg.steps):
+        state = step(state,t)
+        if cfg.verbose and t % max(1,cfg.steps//10)==0:
+            print(f"Step {t}/{cfg.steps} — emergent_score={state.emergent_score:.3f}")
+    dt = time.time()-t0
+    if cfg.verbose: print(f"Simulation done in {dt:.2f}s")
+
+    if cfg.save_state:
+        torch.save(state, cfg.save_state)
+        if cfg.verbose: print(f"State saved to {cfg.save_state}")
+
+    return state
+
+# ===================== CLI =====================
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--size",type=str,default="8,8,8")
+    p.add_argument("--steps",type=int,default=30)
+    p.add_argument("--save",type=str,default=None)
+    p.add_argument("--load",type=str,default=None)
+    p.add_argument("--device",type=str,default=None)
+    p.add_argument("--verbose",action="store_true")
+    args = p.parse_args()
+
+    size = tuple(map(int,args.size.split(",")))
+    cfg = Config(size=size,steps=args.steps,save_state=args.save,load_state=args.load,device_name=args.device,verbose=args.verbose)
+    run_simulation(cfg)
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
+
+    \item \textbf{lways} discretize surrogate outputs before writing into lattice: \verb|pred = mean_probs.argmax(dim=0); state.Phi = pack_trits(pred)|. The code above implements that with \verb|pack_trits|.
+    \item Surrogate predicts \textbf{categorical per-cell} distributions — the surrogate uses softmax \& cross-entropy during training and returns probabilities; the final lattice only receives argmax (discrete).
+    \item Use \textbf{ensemble disagreement} (or entropy) as uncertainty. Do not accept surrogate predictions if uncertain — fall back to exact update.
+    \item Prefer \textbf{conservative thresholds} at first (e.g., 0.1–0.3 disagreement threshold) and measure bias before increasing coverage.
+    \item Keep a \textbf{validation set} of exact transitions to measure surrogate drift (emergent metrics) periodically and retrain when drift increases. 
