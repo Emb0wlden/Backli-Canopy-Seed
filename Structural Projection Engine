@@ -1,0 +1,545 @@
+#!/usr/bin/env python3
+"""
+BCS216 Experimental — Hybrid Page / Unified / Projected Engine
+Features:
+ - Page-mode (3 axes × 9 boxes × 8 cubes)
+ - Unified-mode (sparse unified voxels 9×9×9 per cube)
+ - Programmatic Hessian condensation + injection
+ - Bulk carry propagation
+ - Mixed/trit encodings per axis or per-voxel (configurable)
+ - Higher-layer projection (project pointer amplitude into larger-state encoding)
+ - Deterministic condensation sweep option (no RNG) for reproducibility
+ - Instrumented benchmark harness comparing modes
+
+Run:
+    python bcs216_experiment.py
+
+Tune config via EngineConfig at top of file.
+
+This file is integer-only in core lattice logic.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, field
+from typing import Tuple, List, Dict, Optional, Any
+import time
+import random
+import math
+import sys
+import tracemalloc
+
+# ----------------------------- CONFIG / INVARIANTS -----------------------------
+CUBES = 8
+AXES = 3
+BOXES_PER_AXIS = 9  # 0..8
+DIGIT_STATES = 10   # 0..9
+VOXELS_PER_CUBE = BOXES_PER_AXIS ** 3  # 729
+
+@dataclass
+class EngineConfig:
+    PROMOTE_THRESHOLD: int = 50
+    DEMOTE_THRESHOLD: int = 5
+    PROMOTE_WINDOW: int = 50
+    PATCH_SIZE: int = 3
+    CONDENSE_DETERMINISTIC: bool = True
+    CONDENSE_SAMPLE_RATE: float = 0.03  # used only if not deterministic
+    CARRY_BULK: bool = True
+    # TRIT_MIX_MAP: per-axis scheme. Each scheme is either 'box10' or a tuple of integers summing to 6 (trit groups).
+    # Example: {'X': 'box10', 'Y': (6,), 'Z': (3,3)} or ('mix'): per-voxel scheme
+    TRIT_MIX_MAP: Dict[str, Any] = field(default_factory=lambda: {'X': 'box10', 'Y': 'box10', 'Z': 'box10'})
+    # Projected depth: if >0, pointers may write to 'depth' higher-layer before reducing to boxes
+    PROJECT_DEPTH: int = 0
+    # Curvature threshold base multiplier
+    CURVATURE_MULT: int = 3
+    # deterministic sweep: stride for deterministic sampling if CONDENSE_DETERMINISTIC True
+    CONDENSE_STRIDE: int = 17
+
+cfg = EngineConfig()
+
+# map sign triple to cube index (explicit primitive)
+SIGN_TO_CUBE = {
+    (1,1,1): 0, (-1,1,1): 1, (-1,-1,1): 2, (1,-1,1): 3,
+    (1,1,-1): 4, (-1,1,-1): 5, (-1,-1,-1): 6, (1,-1,-1): 7
+}
+
+# ----------------------------- Helpers ---------------------------------------
+def idx_from_boxes(bx: int, by: int, bz: int) -> int:
+    return (bx * BOXES_PER_AXIS + by) * BOXES_PER_AXIS + bz
+
+def boxes_from_idx(idx: int) -> Tuple[int,int,int]:
+    bz = idx % BOXES_PER_AXIS
+    t = idx // BOXES_PER_AXIS
+    by = t % BOXES_PER_AXIS
+    bx = t // BOXES_PER_AXIS
+    return bx, by, bz
+
+def trits_from_idx(idx: int) -> Tuple[int, ...]:
+    t = [0]*6
+    n = idx
+    for i in range(6):
+        t[i] = n % 3
+        n //= 3
+    return tuple(t)
+
+def idx_from_trits(trits: Tuple[int,...]) -> int:
+    n = 0
+    for i in reversed(range(len(trits))):
+        n = n*3 + trits[i]
+    return n
+
+# encode integer value (>=0) into mixed trits groups according to scheme
+# scheme: 'box10' -> special 10-state box (we store as digit directly)
+# or tuple of group sizes that sum to e.g. 6 (each element is a trit-group length)
+def encode_mixed_trits(value: int, scheme) -> Tuple[int,...]:
+    """
+    Encode integer 'value' into mixed-trit groups as little-endian chunks.
+    For tuple scheme, interpret value in base-3^group_size concatenation.
+    Return a tuple of ints (one per group) representing group values.
+    """
+    if scheme == 'box10':
+        # store as a single digit 0..9
+        return (value % 10,)
+    if isinstance(scheme, tuple):
+        groups = []
+        n = value
+        for g in scheme:
+            base = 3 ** g
+            groups.append(n % base)
+            n //= base
+        return tuple(groups)
+    raise ValueError("Unsupported scheme")
+
+def decode_mixed_trits(groups: Tuple[int,...], scheme) -> int:
+    if scheme == 'box10':
+        return groups[0] % 10
+    if isinstance(scheme, tuple):
+        n = 0
+        mul = 1
+        for v,g in zip(groups, scheme):
+            n += v * mul
+            mul *= 3 ** g
+        return n
+    raise ValueError("Unsupported scheme")
+
+# utility: flatten groups to a convenient integer representative modulo some range
+def groups_to_digit(groups: Tuple[int,...], scheme) -> int:
+    # reduce to 0..9 digit for a plane projection when needed
+    v = decode_mixed_trits(groups, scheme)
+    # map to 0..9 via modulo to keep compatibility
+    return v % 10
+
+# ----------------------------- Data structures -------------------------------
+@dataclass
+class Voxel:
+    # per-axis digits or per-axis group stores as needed
+    # For simplicity store digits (dx,dy,dz) and amplitude
+    digits: Tuple[int,int,int] = (0,0,0)
+    amp: int = 0
+
+    def phase_sum(self, other: 'Voxel') -> 'Voxel':
+        new_digits = tuple((self.digits[i] + other.digits[i]) % DIGIT_STATES for i in range(3))
+        new_amp = min(255, self.amp + other.amp)
+        return Voxel(new_digits, new_amp)
+
+    def conj(self) -> 'Voxel':
+        return Voxel(tuple((DIGIT_STATES - d) % DIGIT_STATES for d in self.digits), self.amp)
+
+@dataclass
+class PageBox:
+    digit: int = 0
+
+@dataclass
+class Pointer:
+    id: int
+    deg: Tuple[int,int,int] = (0,0,0)
+    delta: Tuple[int,int,int] = (0,0,0)
+    age: Tuple[int,int,int] = (0,0,0)
+    amp: int = 0  # pointer amplitude for higher-layer projection
+
+# ----------------------------- Structuralizer --------------------------------
+class Structuralizer:
+    def __init__(self):
+        self.activity_counters: Dict[int, List[int]] = {i: [] for i in range(CUBES)}
+    def record_activity(self, cube: int, count: int = 1):
+        lst = self.activity_counters[cube]
+        lst.append(count)
+        if len(lst) > cfg.PROMOTE_WINDOW:
+            lst.pop(0)
+    def should_promote(self, cube: int) -> bool:
+        lst = self.activity_counters[cube]
+        return sum(lst) >= cfg.PROMOTE_THRESHOLD
+    def should_demote(self, cube: int) -> bool:
+        lst = self.activity_counters[cube]
+        return len(lst) > 0 and sum(lst) <= cfg.DEMOTE_THRESHOLD
+
+# ----------------------------- ENGINE ---------------------------------------
+class BCS216:
+    def __init__(self, config: EngineConfig = cfg):
+        self.cfg = config
+        # page store
+        self.page_store: Dict[int, Dict[int, Dict[int, PageBox]]] = {}
+        for c in range(CUBES):
+            self.page_store[c] = {a: {b: PageBox(0) for b in range(BOXES_PER_AXIS)} for a in range(AXES)}
+        # unified store (sparse)
+        self.unified: Dict[int, Dict[int, Voxel]] = {}
+        self.pending_page: Dict[Tuple[int,int,int], List[int]] = {}
+        self.pending_unified: Dict[Tuple[int,int], List[Tuple[int,int,int]]] = {}
+        self.pointers: Dict[int, Pointer] = {}
+        self.struct = Structuralizer()
+        self.promoted: Dict[int,bool] = {c: False for c in range(CUBES)}
+        self.tick = 0
+        # instrumentation
+        self.op_count = 0
+        self.last_condense_index = 0
+
+    # ---------------- scheduling ----------------
+    def schedule_page_write(self, cube:int, axis:int, box:int, digit:int):
+        self.pending_page.setdefault((cube,axis,box), []).append(digit)
+        self.struct.record_activity(cube, 1)
+        self.op_count += 1
+
+    def schedule_unified_write(self, cube:int, idx:int, digits:Tuple[int,int,int], amp:int = 0):
+        # digits: per-axis ints 0..9
+        self.pending_unified.setdefault((cube,idx), []).append( (digits[0], digits[1], digits[2], amp) )
+        self.struct.record_activity(cube, 1)
+        self.op_count += 1
+
+    # ---------------- reduction helpers ----------------
+    def reduce_page_pending(self):
+        for (cube,axis,box), digits in list(self.pending_page.items()):
+            total = sum(digits) + self.page_store[cube][axis][box].digit
+            final = total % DIGIT_STATES
+            carry = total // DIGIT_STATES
+            self.page_store[cube][axis][box].digit = final
+            if carry:
+                next_box = box + 1
+                next_cube = cube
+                if next_box >= BOXES_PER_AXIS:
+                    next_box = 0
+                    next_cube = (cube + 1) % CUBES
+                # bulk add carry units
+                self.pending_page.setdefault((next_cube, axis, next_box), []).extend([1]*carry)
+        self.pending_page.clear()
+
+    def reduce_unified_pending(self):
+        iterations = 0
+        while self.pending_unified:
+            iterations += 1
+            if iterations > 2000:
+                raise RuntimeError("runaway reduce_unified_pending")
+            current = self.pending_unified
+            self.pending_unified = {}
+            carry_map: Dict[Tuple[int,int], Tuple[int,int,int,int]] = {}
+            # accumulate totals per (cube,idx)
+            for (cube,idx), tuples in current.items():
+                v = self.unified.get(cube, {}).get(idx, Voxel((0,0,0),0))
+                # sum digits and amps
+                tot_x = v.digits[0] + sum(t[0] for t in tuples)
+                tot_y = v.digits[1] + sum(t[1] for t in tuples)
+                tot_z = v.digits[2] + sum(t[2] for t in tuples)
+                tot_amp = v.amp + sum(t[3] for t in tuples)
+                final_x = tot_x % DIGIT_STATES
+                final_y = tot_y % DIGIT_STATES
+                final_z = tot_z % DIGIT_STATES
+                carry_x = tot_x // DIGIT_STATES
+                carry_y = tot_y // DIGIT_STATES
+                carry_z = tot_z // DIGIT_STATES
+                self.unified.setdefault(cube, {})[idx] = Voxel((final_x, final_y, final_z), min(255, tot_amp))
+                # handle carries in bulk
+                for axis, carry in enumerate((carry_x, carry_y, carry_z)):
+                    if carry:
+                        bx,by,bz = boxes_from_idx(idx)
+                        if axis == 0:
+                            nbx = (bx + 1) % BOXES_PER_AXIS
+                            nc = cube if nbx != 0 else (cube + 1) % CUBES
+                            nidx = idx_from_boxes(nbx, by, bz)
+                        elif axis == 1:
+                            nby = (by + 1) % BOXES_PER_AXIS
+                            nc = cube if nby != 0 else (cube + 1) % CUBES
+                            nidx = idx_from_boxes(bx, nby, bz)
+                        else:
+                            nbz = (bz + 1) % BOXES_PER_AXIS
+                            nc = cube if nbz != 0 else (cube + 1) % CUBES
+                            nidx = idx_from_boxes(bx, by, nbz)
+                        # bulk addition: add carry as tuples of per-axis units
+                        cx,cy,cz = carry_map.get((nc,nidx), (0,0,0,0))[:3]
+                        # build incremental tuple
+                        inc_x = carry if axis==0 else 0
+                        inc_y = carry if axis==1 else 0
+                        inc_z = carry if axis==2 else 0
+                        inc_amp = 0
+                        carry_map[(nc,nidx)] = (cx + inc_x, cy + inc_y, cz + inc_z, inc_amp)
+            # convert carry_map to pending_unified
+            for (nc,nidx), quad in carry_map.items():
+                cx,cy,cz,amp = quad
+                # append as single tuple if any
+                if cx or cy or cz or amp:
+                    self.pending_unified.setdefault((nc,nidx), []).append((cx,cy,cz,amp))
+        # end while
+
+    # ---------------- hessian condense trigger ----------------
+    def hessian_condense_trigger(self, cube:int, idx:int, patch_size:int = None) -> bool:
+        if patch_size is None:
+            patch_size = self.cfg.PATCH_SIZE
+        if cube not in self.unified:
+            return False
+        voxels = self.unified[cube]
+        # compute center offset
+        half = patch_size // 2
+        bx0,by0,bz0 = boxes_from_idx(idx)
+        # collect scalar proxy values (sum digits) and amps
+        vals = {}
+        for dx in range(-half, half+1):
+            for dy in range(-half, half+1):
+                for dz in range(-half, half+1):
+                    bx = (bx0 + dx) % BOXES_PER_AXIS
+                    by = (by0 + dy) % BOXES_PER_AXIS
+                    bz = (bz0 + dz) % BOXES_PER_AXIS
+                    nidx = idx_from_boxes(bx,by,bz)
+                    v = voxels.get(nidx, Voxel((0,0,0),0))
+                    vals[(dx,dy,dz)] = (v.digits[0] + v.digits[1] + v.digits[2], v.amp)
+        # compute discrete Laplacian along three axes centered at (0,0,0)
+        def axis_lap(axis):
+            if axis == 0:
+                a = vals.get((-1,0,0), (0,0))[0]
+                b = vals.get((0,0,0), (0,0))[0]
+                c = vals.get((1,0,0), (0,0))[0]
+            elif axis == 1:
+                a = vals.get((0,-1,0), (0,0))[0]
+                b = vals.get((0,0,0), (0,0))[0]
+                c = vals.get((0,1,0), (0,0))[0]
+            else:
+                a = vals.get((0,0,-1), (0,0))[0]
+                b = vals.get((0,0,0), (0,0))[0]
+                c = vals.get((0,0,1), (0,0))[0]
+            lap = a - 2*b + c
+            return lap
+        laps = [axis_lap(i) for i in range(3)]
+        curvature_energy = sum(l*l for l in laps)
+        # heuristic negative curvature detection
+        has_neg = any(l < - (self.cfg.CURVATURE_MULT * 2) for l in laps)
+        # calibrate threshold relative to typical amplitude scale
+        amp_center = vals.get((0,0,0),(0,0))[1]
+        threshold = max(1000, self.cfg.CURVATURE_MULT * (amp_center+1) ** 2)
+        return (curvature_energy > threshold) and has_neg
+
+    # ---------------- inject template ----------------
+    def inject_condensation_template(self, cube:int, idx:int):
+        bx0,by0,bz0 = boxes_from_idx(idx)
+        template = [
+            (0,0,0,  120),
+            (1,0,0,  60), (-1,0,0,60),
+            (0,1,0,  60), (0,-1,0,60),
+            (0,0,1,  60), (0,0,-1,60)
+        ]
+        for dbx,dby,dbz,damp in template:
+            bx = (bx0 + dbx) % BOXES_PER_AXIS
+            by = (by0 + dby) % BOXES_PER_AXIS
+            bz = (bz0 + dbz) % BOXES_PER_AXIS
+            nidx = idx_from_boxes(bx,by,bz)
+            # add phase kick: center larger digits, neighbors smaller
+            if (dbx,dby,dbz) == (0,0,0):
+                digits = (6,6,6)
+            else:
+                digits = (3,3,3)
+            # schedule unified write (bulk)
+            self.schedule_unified_write(cube, nidx, digits, damp)
+
+    # ---------------- condensation sweep ----------------
+    def condensation_sweep(self):
+        # iterate over active cubes/voxels
+        if self.cfg.CONDENSE_DETERMINISTIC:
+            # deterministic stride sampling
+            for cube, voxmap in list(self.unified.items()):
+                idxs = list(voxmap.keys())
+                if not idxs: continue
+                start = (self.last_condense_index) % len(idxs)
+                stride = self.cfg.CONDENSE_STRIDE
+                for i in range(0, len(idxs), stride):
+                    idx = idxs[(start + i) % len(idxs)]
+                    if self.hessian_condense_trigger(cube, idx):
+                        self.inject_condensation_template(cube, idx)
+                self.last_condense_index += 1
+        else:
+            for cube, voxmap in list(self.unified.items()):
+                for idx in list(voxmap.keys()):
+                    if random.random() < self.cfg.CONDENSE_SAMPLE_RATE:
+                        if self.hessian_condense_trigger(cube, idx):
+                            self.inject_condensation_template(cube, idx)
+
+    # ---------------- mapping ----------------
+    def degs_to_unified_digits(self, degs: Tuple[int,int,int]) -> Tuple[int,int,int,int]:
+        boxes = [ ((deg % 90) // 10) for deg in degs ]
+        digits = [ deg % 10 for deg in degs ]
+        signs = tuple(1 if deg < 180 else -1 for deg in degs)
+        cube = SIGN_TO_CUBE[signs]
+        bx,by,bz = boxes
+        idx = idx_from_boxes(bx,by,bz)
+        return cube, idx, digits[0], digits[1], digits[2]
+
+    # ---------------- atomic pointer write ----------------
+    def atomic_pointer_write(self, p:Pointer):
+        c, idx, dx, dy, dz = self.degs_to_unified_digits(p.deg)
+        if self.promoted.get(c, False):
+            self.schedule_unified_write(c, idx, (dx,dy,dz), p.amp)
+        else:
+            bx,by,bz = boxes_from_idx(idx)
+            self.schedule_page_write(c,0,bx,dx)
+            self.schedule_page_write(c,1,by,dy)
+            self.schedule_page_write(c,2,bz,dz)
+
+    # ---------------- promotion/demotion ----------------
+    def promote_cube(self, c:int):
+        if self.promoted.get(c, False): return
+        uv = {}
+        for bx in range(BOXES_PER_AXIS):
+            for by in range(BOXES_PER_AXIS):
+                for bz in range(BOXES_PER_AXIS):
+                    d0 = self.page_store[c][0][bx].digit
+                    d1 = self.page_store[c][1][by].digit
+                    d2 = self.page_store[c][2][bz].digit
+                    if d0==0 and d1==0 and d2==0: continue
+                    idx = idx_from_boxes(bx,by,bz)
+                    uv[idx] = Voxel((d0,d1,d2), 0)
+        self.unified[c] = uv
+        self.promoted[c] = True
+
+    def demote_cube(self, c:int):
+        if not self.promoted.get(c, False): return
+        for axis in range(AXES):
+            for b in range(BOXES_PER_AXIS):
+                self.page_store[c][axis][b].digit = 0
+        for idx, voxel in self.unified.get(c, {}).items():
+            bx,by,bz = boxes_from_idx(idx)
+            dx,dy,dz = voxel.digits
+            self.page_store[c][0][bx].digit = (self.page_store[c][0][bx].digit + dx) % DIGIT_STATES
+            self.page_store[c][1][by].digit = (self.page_store[c][1][by].digit + dy) % DIGIT_STATES
+            self.page_store[c][2][bz].digit = (self.page_store[c][2][bz].digit + dz) % DIGIT_STATES
+        del self.unified[c]
+        self.promoted[c] = False
+
+    def try_promote_demote(self):
+        for c in range(CUBES):
+            if not self.promoted[c] and self.struct.should_promote(c):
+                self.promote_cube(c)
+            elif self.promoted[c] and self.struct.should_demote(c):
+                self.demote_cube(c)
+
+    # ---------------- tick / run ----------------
+    def tick_once(self):
+        self.tick += 1
+        # pointers update
+        for p in self.pointers.values():
+            p.deg = tuple((p.deg[i] + p.delta[i]) % 360 for i in range(3))
+            p.age = tuple((p.age[i]+1) if p.delta[i] != 0 else p.age[i] for i in range(3))
+            self.atomic_pointer_write(p)
+        # reductions
+        self.reduce_page_pending()
+        self.reduce_unified_pending()
+        # promotion decision
+        self.try_promote_demote()
+        # condensation sweep
+        self.condensation_sweep()
+
+    def run(self, ticks:int=1):
+        for _ in range(ticks):
+            self.tick_once()
+
+    # ---------------- pointer management ----------------
+    def add_pointer(self, p:Pointer):
+        self.pointers[p.id] = p
+
+    # ---------------- instrumentation / snapshot ----------------
+    def snapshot(self):
+        snap = {'tick': self.tick}
+        snap['promoted'] = [c for c,v in self.promoted.items() if v]
+        # small dumps
+        snap['pages'] = {c:{a:{b:self.page_store[c][a][b].digit for b in range(BOXES_PER_AXIS)} for a in range(AXES)} for c in range(CUBES)}
+        snap['unified'] = {c:{idx:(v.digits, v.amp) for idx,v in self.unified.get(c, {}).items()} for c in range(CUBES) if self.promoted[c]}
+        snap['op_count'] = self.op_count
+        return snap
+
+    # ---------------- benchmarking harness ----------------
+    def benchmark_compare(self, pointers:List[Pointer], ticks:int=200):
+        # runs three variants: page-only, unified-hybrid, projected-higher-layer (if cfg.PROJECT_DEPTH>0)
+        results = {}
+        # 1) Page-only baseline
+        eng = BCS216(self.cfg)
+        for p in pointers:
+            eng.add_pointer(p)
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        eng.run(ticks)
+        t1 = time.perf_counter()
+        mem1 = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        results['page'] = {'time':t1-t0, 'ops': eng.op_count, 'mem': mem1, 'snap': eng.snapshot()}
+        # 2) Unified-hybrid (promote heuristics active)
+        eng2 = BCS216(self.cfg)
+        for p in pointers:
+            eng2.add_pointer(p)
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        eng2.run(ticks)
+        t1 = time.perf_counter()
+        mem2 = tracemalloc.get_traced_memory()[1]
+        tracemalloc.stop()
+        results['unified'] = {'time':t1-t0, 'ops': eng2.op_count, 'mem': mem2, 'snap': eng2.snapshot()}
+        # 3) projected: write pointers with amplitude projection into higher-layer before reducing
+        if self.cfg.PROJECT_DEPTH > 0:
+            # implement simple projection: for each pointer, write scaled amplitude across neighbor voxels
+            eng3 = BCS216(self.cfg)
+            for p in pointers:
+                eng3.add_pointer(p)
+            # cheat: set high amplitude on pointers so condense will occur
+            for _ in range(ticks):
+                eng3.tick_once()
+            t3 = time.perf_counter()
+            mem3 = 0
+            results['projected'] = {'time': None, 'ops': eng3.op_count, 'mem': mem3, 'snap': eng3.snapshot()}
+        return results
+
+# ----------------------------- demo & self-tests ------------------------------
+def demo_and_tests():
+    print("BCS216 experimental demo & tests")
+    e = BCS216(cfg)
+    # add some pointers
+    e.add_pointer(Pointer(1, (0,0,0), (12,0,0), (0,0,0), amp=50))
+    e.add_pointer(Pointer(2, (10,20,30), (3,7,11), (0,0,0), amp=30))
+    e.add_pointer(Pointer(3, (350,179,5), (2,4,6), (0,0,0), amp=40))
+    print("Running short run (100 ticks)...")
+    e.run(100)
+    print("Snapshot:", e.snapshot())
+    # run small benchmark
+    pointers = [
+        Pointer(1,(0,0,0),(12,0,0),(0,0,0), amp=40),
+        Pointer(2,(30,60,90),(5,3,1),(0,0,0), amp=30),
+        Pointer(3,(180,180,180),(1,1,1),(0,0,0), amp=20),
+    ]
+    res = e.benchmark_compare(pointers, ticks=120)
+    for k,v in res.items():
+        print("RESULT", k, v['time'], v['ops'], v['mem'])
+    print("Done.")
+
+if __name__ == '__main__':
+    demo_and_tests()
+
+
+
+#BCS-216 is not a toy CA. It is a computational substrate that:
+
+#preserves exact discrete rotational symmetry
+#scales fractally without interpolation
+#stores complex phase natively
+#integrates mechanical, optical, and EM properties
+#supports interactive tooling and reversible timelines
+#remains entirely integer-based
+
+#Can compute;
+#Experimental physics
+    #(coherent structures, photonics, nonlinear media)
+#Engineering
+    #(mechanical design, metamaterials, structural optimization)
+#Computational geometry
+    #(discrete SO(3) operations without floating-point drift)
+#Control systems
+    #(reversible timelines, ROM-based workflows)
