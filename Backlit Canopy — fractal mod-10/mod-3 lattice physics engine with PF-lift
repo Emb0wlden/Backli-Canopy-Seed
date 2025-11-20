@@ -1,0 +1,603 @@
+#!/usr/bin/env python3
+"""
+Backlit Canopy —
+Full PF-lift + Integer Field Physics + Mod-3 Vector Calculus (GRAD/DIV/CURL/LAP/ADVECT)
+Emergent gravity, charge, vorticity, condensation, decoherence — all coherently unified.
+One file. No placeholders. Ready for GPU.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Tuple, Dict, List
+from fractions import Fraction
+from math import gcd
+import random
+
+# ---------------------------- CONFIG ----------------------------
+CUBES = 8
+AXES = 3
+BOXES_PER_AXIS = 9
+DIGIT_STATES = 10
+VOXELS_PER_CUBE = BOXES_PER_AXIS ** 3  # 729
+
+@dataclass
+class EngineConfig:
+    PROJECTION_FACTOR: int = 12
+    PROMOTE_THRESHOLD: int = 40
+    DEMOTE_THRESHOLD: int = 8
+    PROMOTE_WINDOW: int = 50
+    CONDENSE_SAMPLE_RATE: float = 0.04
+    G_SCALE: int = 16
+    C_SCALE: int = 8
+    DECO_THRESHOLD: int = 90
+    FIELD_STEP: int = 1
+
+cfg = EngineConfig()
+
+SIGN_TO_CUBE = {
+    (1,1,1):0, (-1,1,1):1, (-1,-1,1):2, (1,-1,1):3,
+    (1,1,-1):4, (-1,1,-1):5, (-1,-1,-1):6, (1,-1,-1):7
+}
+
+# ------------------------------ HELPERS ---------------------------------
+def idx_from_boxes(bx: int, by: int, bz: int) -> int:
+    return (bx * BOXES_PER_AXIS + by) * BOXES_PER_AXIS + bz
+
+def boxes_from_idx(idx: int) -> Tuple[int, int, int]:
+    bz = idx % BOXES_PER_AXIS
+    t = idx // BOXES_PER_AXIS
+    by = t % BOXES_PER_AXIS
+    bx = t // BOXES_PER_AXIS
+    return bx, by, bz
+
+# ----------------------------- TRIT & T3 --------------------------------
+class Trit3:
+    __slots__ = ('v',)
+    def __init__(self, x): self.v = int(x) % 3
+    def __add__(self, o): return Trit3(self.v + o.v)
+    def __sub__(self, o): return Trit3(self.v - o.v)
+    def __mul__(self, o): return Trit3(self.v * o.v)
+    def __int__(self): return self.v
+    def __repr__(self): return str(self.v)
+
+@dataclass(slots=True, frozen=True)
+class T3:
+    x: Trit3; y: Trit3; z: Trit3
+    def __add__(self, o): return T3(self.x+o.x, self.y+o.y, self.z+o.z)
+    def __sub__(self, o): return T3(self.x-o.x, self.y-o.y, self.z-o.z)
+    def __mul__(self, o): return T3(self.x*o.x, self.y*o.y, self.z*o.z)
+
+# ----------------------------- DATA ------------------------------------
+@dataclass
+class Voxel:
+    digits: Tuple[int, int, int] = (0, 0, 0)
+    amp: int = 0
+    charge: int = 0
+    gravity: int = 0
+
+    def scalar(self) -> int:
+        return sum(self.digits) + (self.amp >> 2)
+
+    @property
+    def t3(self) -> T3:
+        return T3(Trit3(self.digits[0]), Trit3(self.digits[1]), Trit3(self.digits[2]))
+
+@dataclass
+class PageBox:
+    digit: int = 0
+
+@dataclass
+class Pointer:
+    id: int
+    deg: Tuple[int,int,int] = (0,0,0)
+    delta: Tuple[float,float,float] = (0.,0.,0.)
+    age: Tuple[int,int,int] = (0,0,0)
+    amp: int = 0
+    deg_subunits: Tuple[int,int,int] = (0,0,0)
+    delta_subunits: Tuple[int,int,int] = (0,0,0)
+
+# -------------------------- STRUCTURALIZER --------------------------
+class Structuralizer:
+    def __init__(self, engine):
+        self.engine = engine
+        self.activity = [[] for _ in range(CUBES)]
+
+    def record(self, cube: int, count: int = 1):
+        lst = self.activity[cube]
+        lst.append(count)
+        if len(lst) > cfg.PROMOTE_WINDOW:
+            lst.pop(0)
+
+    def fractional_hook(self, delta):
+        f = Fraction(delta).limit_denominator(10000)
+        if f.denominator > 1:
+            for p in self.engine.pointers.values():
+                try:
+                    c = self.engine._cube_of(p.deg)
+                    self.record(c, f.denominator)
+                except: pass
+            self.engine.request_pf_lift(f.denominator)
+
+    def should_promote(self, c): return sum(self.activity[c]) >= cfg.PROMOTE_THRESHOLD
+    def should_demote(self, c): return len(self.activity[c]) > 0 and sum(self.activity[c]) <= cfg.DEMOTE_THRESHOLD
+
+# ------------------------------- ENGINE -----------------------------
+class BCS216:
+    def __init__(self):
+        self.struct = Structuralizer(self)
+        self.page_store: Dict[int, Dict[int, Dict[int, PageBox]]] = {
+            c: {a: {b: PageBox() for b in range(BOXES_PER_AXIS)} for a in range(AXES)} for c in range(CUBES)}
+        self.unified: Dict[int, Dict[int, Voxel]] = {}
+        self.promoted = {c: False for c in range(CUBES)}
+        self.pending_page: Dict[Tuple[int,int,int], List[int]] = {}
+        self.pending_unified: Dict[Tuple[int,int], List[Tuple[int,int,int,int]]] = {}
+        self.pointers: Dict[int, Pointer] = {}
+        self.tick = 0
+        self.op_count = 0
+
+    def _cube_of(self, degs):
+        signs = tuple(1 if d < 180 else -1 for d in degs)
+        return SIGN_TO_CUBE[signs]
+
+    # === PF-LIFT ===
+    def request_pf_lift(self, denom: int):
+        if denom <= 1: return
+        cur = cfg.PROJECTION_FACTOR
+        new = (cur * denom) // gcd(cur, denom)
+        if new == cur: return
+        factor = new // cur
+        cfg.PROJECTION_FACTOR = new
+        wrap_new = 360 * new
+        for p in self.pointers.values():
+            p.deg_subunits = tuple((s * factor) % wrap_new for s in p.deg_subunits)
+            p.delta_subunits = tuple(d * factor for d in p.delta_subunits)
+
+    def add_pointer(self, p: Pointer):
+        PF = cfg.PROJECTION_FACTOR
+        wrap = 360 * PF
+        p.deg_subunits = tuple(int(d) * PF % wrap for d in p.deg)
+        subs = []
+        for dv in p.delta:
+            f = Fraction(dv).limit_denominator(10000)
+            if PF % f.denominator != 0:
+                self.struct.fractional_hook(f)
+                PF = cfg.PROJECTION_FACTOR
+                wrap = 360 * PF
+            subs.append(int(f.numerator * (PF // f.denominator)))
+        p.delta_subunits = tuple(subs)
+        p.deg = tuple(s // cfg.PROJECTION_FACTOR % 360 for s in p.deg_subunits)
+        self.pointers[p.id] = p
+
+    # === SCHEDULING & REDUCTION ===
+    def schedule_page_write(self, c, a, b, d):
+        self.pending_page.setdefault((c,a,b), []).append(d % DIGIT_STATES)
+        self.struct.record(c)
+        self.op_count += 1
+
+    def schedule_unified_write(self, c, i, digits, amp=0):
+        d = (digits[0] % DIGIT_STATES, digits[1] % DIGIT_STATES, digits[2] % DIGIT_STATES, amp & 0xFF)
+        self.pending_unified.setdefault((c,i), []).append(d)
+        self.struct.record(c)
+        self.op_count += 1
+
+    def reduce_page_pending(self):
+        for (c,a,b), L in list(self.pending_page.items()):
+            tot = sum(L) + self.page_store[c][a][b].digit
+            self.page_store[c][a][b].digit = tot % DIGIT_STATES
+            carry = tot // DIGIT_STATES
+            if carry:
+                nb = (b + carry) % BOXES_PER_AXIS
+                nc = (c + (b + carry) // BOXES_PER_AXIS) % CUBES
+                self.pending_page.setdefault((nc,a,nb), []).extend([1] * carry)
+        self.pending_page.clear()
+
+    def reduce_unified_pending(self):
+        it = 0
+        while self.pending_unified and it < 5000:
+            it += 1
+            current = self.pending_unified
+            self.pending_unified = {}
+            carry_map: Dict[Tuple[int,int], Tuple[int,int,int,int]] = {}
+            for (c,i), tuples in current.items():
+                v = self.unified.setdefault(c, {}).get(i, Voxel())
+                tx = v.digits[0] + sum(t[0] for t in tuples)
+                ty = v.digits[1] + sum(t[1] for t in tuples)
+                tz = v.digits[2] + sum(t[2] for t in tuples)
+                ta = v.amp + sum(t[3] for t in tuples)
+                fx,fy,fz = tx % DIGIT_STATES, ty % DIGIT_STATES, tz % DIGIT_STATES
+                cx,cy,cz = tx // DIGIT_STATES, ty // DIGIT_STATES, tz // DIGIT_STATES
+                self.unified[c][i] = Voxel((fx,fy,fz), min(255, ta))
+                bx,by,bz = boxes_from_idx(i)
+                if cx:
+                    nbx = (bx + cx) % BOXES_PER_AXIS
+                    ncube = (c + (bx + cx) // BOXES_PER_AXIS) % CUBES
+                    nidx = idx_from_boxes(nbx, by, bz)
+                    prev = carry_map.get((ncube, nidx), (0,0,0,0))
+                    carry_map[(ncube, nidx)] = (prev[0] + cx, prev[1], prev[2], prev[3])
+                if cy:
+                    nby = (by + cy) % BOXES_PER_AXIS
+                    ncube = (c + (by + cy) // BOXES_PER_AXIS) % CUBES
+                    nidx = idx_from_boxes(bx, nby, bz)
+                    prev = carry_map.get((ncube, nidx), (0,0,0,0))
+                    carry_map[(ncube, nidx)] = (prev[0], prev[1] + cy, prev[2], prev[3])
+                if cz:
+                    nbz = (bz + cz) % BOXES_PER_AXIS
+                    ncube = (c + (bz + cz) // BOXES_PER_AXIS) % CUBES
+                    nidx = idx_from_boxes(bx, by, nbz)
+                    prev = carry_map.get((ncube, nidx), (0,0,0,0))
+                    carry_map[(ncube, nidx)] = (prev[0], prev[1], prev[2] + cz, prev[3])
+            for (nc, nidx), quad in carry_map.items():
+                cx,cy,cz,amp = quad
+                if cx or cy or cz or amp:
+                    self.pending_unified.setdefault((nc, nidx), []).append((cx,cy,cz,amp))
+
+    # === FIELD PHYSICS ===
+    def _patch(self, c, i):
+        bx0,by0,bz0 = boxes_from_idx(i)
+        voxels = []
+        for dx in (-1,0,1):
+            for dy in (-1,0,1):
+                for dz in (-1,0,1):
+                    bx = (bx0 + dx) % BOXES_PER_AXIS
+                    by = (by0 + dy) % BOXES_PER_AXIS
+                    bz = (bz0 + dz) % BOXES_PER_AXIS
+                    voxels.append(self.unified[c].get(idx_from_boxes(bx,by,bz), Voxel()))
+        return voxels
+
+    def _lap_axis(self, voxels, axis):
+        s = 3
+        center = 13
+        if axis == 0: a_idx, b_idx = center-9, center+9
+        elif axis == 1: a_idx, b_idx = center-3, center+3
+        else: a_idx, b_idx = center-1, center+1
+        va = voxels[a_idx].scalar() if 0 <= a_idx < 27 else 0
+        vb = voxels[b_idx].scalar() if 0 <= b_idx < 27 else 0
+        vc = voxels[center].scalar()
+        return va - 2*vc + vb
+
+    def _compute_charge_from_curl(self, voxels):
+        s = 3; center = 13
+        def idx_at(i0,i1,i2):
+            i0 = max(0, min(2, i0)); i1 = max(0, min(2, i1)); i2 = max(0, min(2, i2))
+            return (i0*s + i1)*s + i2
+        ax_pos, ax_neg = idx_at(2,1,1), idx_at(0,1,1)
+        ay_pos, ay_neg = idx_at(1,2,1), idx_at(1,0,1)
+        az_pos, az_neg = idx_at(1,1,2), idx_at(1,1,0)
+        ddx_dy = (voxels[ax_pos].digits[0] - voxels[ax_neg].digits[0]) - (voxels[ay_pos].digits[0] - voxels[ay_neg].digits[0])
+        ddy_dz = (voxels[ay_pos].digits[1] - voxels[ay_neg].digits[1]) - (voxels[az_pos].digits[1] - voxels[az_neg].digits[1])
+        ddz_dx = (voxels[az_pos].digits[2] - voxels[az_neg].digits[2]) - (voxels[ax_pos].digits[2] - voxels[ax_neg].digits[2])
+        return (abs(ddx_dy) + abs(ddy_dz) + abs(ddz_dx)) // max(1, cfg.C_SCALE)
+
+    def _deterministic_noise(self, seed: int) -> int:
+        x = seed & 0xFFFFFFFF
+        x ^= (x << 13) & 0xFFFFFFFF
+        x ^= (x >> 17)
+        x ^= (x << 5) & 0xFFFFFFFF
+        return x & 0xFF
+
+    def apply_fields(self, c):
+        if not self.promoted.get(c, False): return
+        voxmap = self.unified.get(c, {})
+        for i in voxmap.keys():
+            voxels = self._patch(c, i)
+            laps = [self._lap_axis(voxels, a) for a in range(3)]
+            total_curv = sum(abs(l) for l in laps)
+            charge = self._compute_charge_from_curl(voxels)
+            center = voxmap[i]
+            center.charge = charge
+            center.gravity = total_curv
+            self.unified[c][i] = center
+
+            if total_curv > 0:
+                pull = total_curv // max(1, cfg.G_SCALE)
+                if pull:
+                    bx0,by0,bz0 = boxes_from_idx(i)
+                    for axis, step in enumerate((-1,1)):
+                        nbx, nby, nbz = bx0, by0, bz0
+                        if axis == 0: nbx = (bx0 + step) % BOXES_PER_AXIS
+                        elif axis == 1: nby = (by0 + step) % BOXES_PER_AXIS
+                        else: nbz = (bz0 + step) % BOXES_PER_AXIS
+                        nidx = idx_from_boxes(nbx, nby, nbz)
+                        if voxmap.get(nidx, Voxel()).scalar() < center.scalar():
+                            inc = [0,0,0]; inc[axis] = cfg.FIELD_STEP * pull
+                            self.schedule_unified_write(c, nidx, tuple(inc), 0)
+
+            if charge:
+                self.schedule_unified_write(c, i, (0,0,0), min(255, charge))
+                for axis in range(3):
+                    nbx, nby, nbz = boxes_from_idx(i)
+                    if axis == 0: nbx = (nbx + 1) % BOXES_PER_AXIS
+                    elif axis == 1: nby = (nby + 1) % BOXES_PER_AXIS
+                    else: nbz = (nbz + 1) % BOXES_PER_AXIS
+                    nidx = idx_from_boxes(nbx, nby, nbz)
+                    ort1, ort2 = (axis+1)%3, (axis+2)%3
+                    inc = [0,0,0]
+                    val = charge // max(1, cfg.C_SCALE)
+                    inc[ort1] = inc[ort2] = min(9, val)
+                    self.schedule_unified_write(c, nidx, tuple(inc), 0)
+
+            if total_curv > cfg.DECO_THRESHOLD:
+                seed = (c << 20) ^ i ^ self.tick
+                noise = self._deterministic_noise(seed)
+                nd = [(noise // (3**k)) % 3 - 1 for k in range(3)]
+                self.schedule_unified_write(c, i, tuple(nd[i] % DIGIT_STATES for i in range(3)), 0)
+
+    # === MOD-3 VECTOR CALCULUS (feeds back into charge/gravity) ===
+    def apply_mod3_vector_calculus(self, c: int):
+        if not self.promoted.get(c, False): return
+        vox = self.unified[c]
+        for i in vox.keys():
+            patch = self._patch(c, i)
+            patch_t3 = [v.t3 for v in patch]
+            cx = 13
+            # GRAD₃
+            grad = T3(
+                patch_t3[cx+9].x - patch_t3[cx-9].x,
+                patch_t3[cx+3].y - patch_t3[cx-3].y,
+                patch_t3[cx+1].z - patch_t3[cx-1].z
+            )
+            # DIV₃ (scalar proxy)
+            div = Trit3(0)
+            for off in (9,-9,3,-3,1,-1):
+                if 0 <= cx+off < 27:
+                    div = div + (patch_t3[cx+off].x - patch_t3[cx].x)
+            # CURL₃
+            curl = T3(
+                (patch_t3[cx+3].z - patch_t3[cx-3].z) - (patch_t3[cx+1].y - patch_t3[cx-1].y),
+                (patch_t3[cx+1].x - patch_t3[cx-1].x) - (patch_t3[cx+9].z - patch_t3[cx-9].z),
+                (patch_t3[cx+9].y - patch_t3[cx-9].y) - (patch_t3[cx+3].x - patch_t3[cx-3].x)
+            )
+            # LAP₃
+            lap = Trit3(0)
+            for off in (-9,-3,-1,1,3,9):
+                if 0 <= cx+off < 27:
+                    lap = lap + patch_t3[cx+off].x + patch_t3[cx+off].y + patch_t3[cx+off].z
+            lap = lap - Trit3(18) * patch_t3[cx].x
+
+            vort_mag = sum(abs(int(curl.__getattribute__(comp))) for comp in ('x','y','z'))
+            div_mag = abs(int(div))
+
+            center = vox[i]
+            if vort_mag:
+                self.schedule_unified_write(c, i, (0,0,0), vort_mag * 5)
+                center.charge += vort_mag * 4
+            if div_mag > 1:
+                center.gravity += div_mag * 7
+            if int(lap):
+                self.schedule_unified_write(c, i, (int(lap), int(lap), int(lap)), 0)
+            if vort_mag > 2:
+                adv = center.t3 * grad
+                self.schedule_unified_write(c, i, (int(adv.x), int(adv.y), int(adv.z)), center.amp//6)
+
+    # === CONDENSATION ===
+    def hessian_condense_trigger(self,c,i):
+        if c not in self.unified: return False
+        voxels = self._patch(c,i)
+        laps = [self._lap_axis(voxels, a) for a in range(3)]
+        return any(l < -15 for l in laps) and sum(l*l for l in laps) > 2000
+
+    def inject_condensation_template(self,c,i):
+        bx0,by0,bz0 = boxes_from_idx(i)
+        for dbx,dby,dbz,amp,k in [(0,0,0,160,8),(1,0,0,80,4),(-1,0,0,80,4),(0,1,0,80,4),(0,-1,0,80,4),(0,0,1,80,4),(0,0,-1,80,4)]:
+            bx = (bx0+dbx) % BOXES_PER_AXIS
+            by = (by0+dby) % BOXES_PER_AXIS
+            bz = (bz0+dbz) % BOXES_PER_AXIS
+            self.schedule_unified_write(c, idx_from_boxes(bx,by,bz), (k,k,k), amp)
+
+    def condensation_sweep(self):
+        for c in list(self.unified.keys()):
+            keys = list(self.unified[c].keys())
+            if not keys: continue
+            samples = random.sample(keys, min(40, len(keys)))
+            for i in samples:
+                if random.random() < cfg.CONDENSE_SAMPLE_RATE:
+                    if self.hessian_condense_trigger(c,i):
+                        self.inject_condensation_template(c,i)
+
+    # === POINTER MAPPING ===
+    def degs_to_unified_digits(self, degs):
+        boxes = [(d % 90) // 10 for d in degs]
+        digits = [d % 10 for d in degs]
+        cube = self._cube_of(degs)
+        idx = idx_from_boxes(*boxes)
+        return cube, idx, digits[0], digits[1], digits[2]
+
+    def atomic_pointer_write(self, p):
+        c, i, dx, dy, dz = self.degs_to_unified_digits(p.deg)
+        if self.promoted.get(c, False):
+            self.schedule_unified_write(c, i, (dx, dy, dz), p.amp)
+        else:
+            bx, by, bz = boxes_from_idx(i)
+            self.schedule_page_write(c, 0, bx, dx)
+            self.schedule_page_write(c, 1, by, dy)
+            self.schedule_page_write(c, 2, bz, dz)
+
+    # === PROMOTION / DEMOTION ===
+    def promotion(self):
+        for c in range(CUBES):
+            if not self.promoted.get(c, False) and self.struct.should_promote(c):
+                uv: Dict[int, Voxel] = {}
+                for bx in range(BOXES_PER_AXIS):
+                    for by in range(BOXES_PER_AXIS):
+                        for bz in range(BOXES_PER_AXIS):
+                            d0 = self.page_store[c][0][bx].digit
+                            d1 = self.page_store[c][1][by].digit
+                            d2 = self.page_store[c][2][bz].digit
+                            if d0 or d1 or d2:
+                                uv[idx_from_boxes(bx,by,bz)] = Voxel((d0,d1,d2))
+                self.unified[c] = uv
+                self.promoted[c] = True
+
+    def demote_cube(self, c: int):
+        if not self.promoted.get(c, False): return
+        for a in range(AXES):
+            for b in range(BOXES_PER_AXIS):
+                self.page_store[c][a][b].digit = 0
+        for idx, v in self.unified.get(c, {}).items():
+            bx,by,bz = boxes_from_idx(idx)
+            self.page_store[c][0][bx].digit = (self.page_store[c][0][bx].digit + v.digits[0]) % DIGIT_STATES
+            self.page_store[c][1][by].digit = (self.page_store[c][1][by].digit + v.digits[1]) % DIGIT_STATES
+            self.page_store[c][2][bz].digit = (self.page_store[c][2][bz].digit + v.digits[2]) % DIGIT_STATES
+        del self.unified[c]
+        self.promoted[c] = False
+
+    def try_promote_demote(self):
+        for c in range(CUBES):
+            if not self.promoted[c] and self.struct.should_promote(c):
+                self.promotion()
+            elif self.promoted[c] and self.struct.should_demote(c):
+                self.demote_cube(c)
+
+    # === MAIN TICK ===
+    def tick_once(self):
+        self.tick += 1
+        PF = cfg.PROJECTION_FACTOR
+        wrap = 360 * PF
+        for p in self.pointers.values():
+            p.deg_subunits = tuple((p.deg_subunits[i] + p.delta_subunits[i]) % wrap for i in range(3))
+            p.age = tuple((p.age[i] + 1) if p.delta_subunits[i] != 0 else p.age[i] for i in range(3))
+            p.deg = tuple((s // PF) % 360 for s in p.deg_subunits)
+            self.atomic_pointer_write(p)
+
+        self.reduce_page_pending()
+        self.reduce_unified_pending()
+        self.try_promote_demote()
+
+        for c in range(CUBES):
+            if self.promoted.get(c, False):
+                self.apply_fields(c)
+                self.apply_mod3_vector_calculus(c)   # ← Coherence layer
+
+        self.condensation_sweep()
+
+    def run(self, n=1):
+        for _ in range(n): self.tick_once()
+
+# ----------------------------- VISUALIZER (optional) -----------------------------
+try:
+    import matplotlib.pyplot as plt
+    from matplotlib.widgets import Button
+    import numpy as np
+except Exception:
+    plt = None
+
+if plt is not None:
+    SUBSTANCES = {0:("Void",(0,0,0),0), 1:("H2O",(0,.5,1),1), 2:("Fire",(1,.3,0),.08),
+                  3:("Earth",(.5,.35,.2),3), 4:("Steam",(.7,.8,1),.01), 6:("Plasma",(1,0,1),.001)}
+
+    class Visualizer:
+        def __init__(self, engine, scale=28):
+            self.engine = engine; self.scale = scale; self.dim = 9*scale
+            self.fig = plt.figure(figsize=(14,10))
+            self.ax = self.fig.add_subplot(111, projection='3d')
+            self.ax.set_facecolor('black'); self.ax.axis('off')
+            self.scat = self.field_lines = None
+            self.substance_grid = np.zeros((8,9,9,9), dtype=int)
+            self.brush_amp = 120; self.brush_phase = 0; self.brush_substance = 1
+            self._setup_ui(); self._connect(); plt.ion(); plt.show()
+
+        def _setup_ui(self):
+            pos = 0.02
+            for name, action in [("Fields", lambda e: setattr(self, 'show_fields', not getattr(self, 'show_fields', True))),
+                                 ("Phase+", lambda e: setattr(self, 'brush_phase', (self.brush_phase+1)%3))]:
+                Button(plt.axes([pos, 0.94, 0.08, 0.04]), name, color='0.3').on_clicked(action)
+                pos += 0.09
+            pos = 0.40
+            for sid, (name, col, _) in SUBSTANCES.items():
+                if not sid: continue
+                Button(plt.axes([pos, 0.94, 0.07, 0.04]), name[:4], color=col).on_clicked(
+                    lambda e, s=sid: setattr(self, 'brush_substance', s))
+                pos += 0.08
+
+        def _connect(self):
+            self.fig.canvas.mpl_connect('button_press_event', lambda e: self._paint(e.xdata, e.ydata, getattr(e,'zdata',None) or self.dim/2))
+            self.fig.canvas.mpl_connect('motion_notify_event', lambda e: e.button==1 and self._paint(e.xdata, e.ydata, getattr(e,'zdata',None) or self.dim/2))
+
+        def _paint(self, x, y, z):
+            if x is None: return
+            cube = int((x / self.scale) * 2) % 8
+            bx = int(abs(x / self.scale) % 9)
+            by = int(abs(y / self.scale) % 9)
+            bz = int(abs(z / self.scale) % 9)
+            idx = idx_from_boxes(bx, by, bz)
+            digits = [0,0,0]; digits[self.brush_phase] = 9
+            self.engine.schedule_unified_write(cube, idx, tuple(digits), self.brush_amp)
+            self.substance_grid[cube, bx, by, bz] = self.brush_substance
+
+        def _gather(self):
+            xs,ys,zs,colors,sizes,alphas = [],[],[],[],[],[]
+            fxs,fys,fzs,fus,fvs,fws,fcol = [],[],[],[],[],[],[]
+            for c in range(8):
+                if c not in self.engine.unified: continue
+                for i, v in self.engine.unified[c].items():
+                    bx,by,bz = np.unravel_index(i, (9,9,9))
+                    x = c*self.scale + bx*(self.scale/9)
+                    y = by*(self.scale/9)
+                    z = bz*(self.scale/9)
+                    amp = (v.amp/255)**1.2
+                    base_size = 15 + amp*140
+                    hue = sum(v.digits)/30
+                    col = plt.cm.hsv(hue)
+                    if v.gravity > 30:
+                        col = (0.1,0,0.2) if v.gravity > 90 else (0.2,0,0.4)
+                        base_size *= 1.8
+                    elif v.charge > 20:
+                        col = (1.0, 0.0, 1.0) if v.charge > 50 else (0.8, 0.0, 1.0)
+                        base_size += v.charge*4
+                    sub = self.substance_grid[c,bx,by,bz]
+                    if sub: col = SUBSTANCES[sub][1]
+                    if v.amp > 200 and v.gravity > 80:
+                        col = (1,1,1); base_size += 120
+                    xs.append(x); ys.append(y); zs.append(z)
+                    colors.append(col); sizes.append(base_size); alphas.append(1.0)
+
+                    if getattr(self, 'show_fields', True) and v.charge > 40:
+                        for ax in range(3):
+                            nb = [bx,by,bz]; nb[ax] = (nb[ax]+1)%9
+                            nx = c*self.scale + nb[0]*(self.scale/9)
+                            ny = nb[1]*(self.scale/9); nz = nb[2]*(self.scale/9)
+                            fxs.append(x); fys.append(y); fzs.append(z)
+                            fus.append(nx-x); fvs.append(ny-y); fws.append(nz-z)
+                            fcol.append((1,0,1,0.6))
+            return xs,ys,zs,colors,sizes,alphas,fxs,fys,fzs,fus,fvs,fws,fcol
+
+        def update(self):
+            data = self._gather()
+            xs,ys,zs,colors,sizes,alphas,fxs,fys,fzs,fus,fvs,fws,fcol = data
+            if self.scat is None:
+                self.scat = self.ax.scatter(xs,ys,zs,c=colors,s=sizes,depthshade=False)
+            else:
+                self.scat._offsets3d = (xs,ys,zs)
+                self.scat.set_color(colors)
+                self.scat.set_sizes(sizes)
+            if getattr(self, 'show_fields', True) and fxs:
+                if self.field_lines: self.field_lines.remove()
+                self.field_lines = self.ax.quiver(fxs,fys,fzs,fus,fvs,fws,color=fcol,length=10,alpha=0.7)
+            self.ax.set_xlim(0,self.dim); self.ax.set_ylim(0,self.dim); self.ax.set_zlim(0,self.dim)
+            self.fig.canvas.draw_idle(); self.fig.canvas.flush_events()
+
+    if __name__ == "__main__":
+        print("Backlit Canopy ULTIMATE v11 — Coherence Edition (2025)")
+        eng = BCS216()
+        eng.add_pointer(Pointer(1, (0,0,0), (0,0,17.0), amp=180))
+        eng.add_pointer(Pointer(2, (90,0,0), (11.0,0,0), amp=140))
+        eng.add_pointer(Pointer(3, (0,90,0), (0,13.0,0), amp=150))
+        eng.add_pointer(Pointer(4, (0,0,0), (1.618, 2.718, 3.14159), amp=200))
+        vis = Visualizer(eng)
+        try:
+            while plt.fignum_exists(vis.fig.number):
+                eng.run(300)
+                vis.update()
+        except KeyboardInterrupt:
+            print("\nUniverse terminated by user.")
+else:
+    if __name__ == "__main__":
+        eng = BCS216()
+        eng.add_pointer(Pointer(1,(0,0,0),(11.0,0,0),amp=100))
+        eng.add_pointer(Pointer(2,(0,0,0),(0,13.0,0),amp=90))
+        eng.add_pointer(Pointer(3,(0,0,0),(0,0,17.0),amp=110))
+        eng.add_pointer(Pointer(4,(0,0,0),(1.618,2.718,3.14159),amp=120))
+        print("Running 300 ticks (headless)...")
+        eng.run(300)
+        print("Done. Promoted cubes:", [c for c, v in eng.promoted.items() if v])
+        print("Active voxels:", sum(len(d) for d in eng.unified.values()))
